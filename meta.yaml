@@ -1,17 +1,16 @@
 {% set name = "edterm" %}
-{% set version = "0.1.0" %}
+{% set version = "0.1.1" %}
 
 package:
   name: "{{ name|lower }}"
   version: "{{ version }}"
 
 source:
-  url: https://github.com/mattiafelice-palermo/{{ name }}/archive/refs/tags/{{ version }}.zip
+  url: https://github.com/mattiafelice-palermo/{{ name }}/archive/refs/tags/v{{ version }}.zip
 
 build:
   noarch: python
   number: 0
-  script: "{{ PYTHON }} -m pip install . --no-deps --ignore-installed -vv" 
 
 requirements:
   host:
