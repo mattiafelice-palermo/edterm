@@ -13,6 +13,7 @@ setup(
     install_requires=[
         'pandas',
         'plotext',
+        'panedr',
     ],
     entry_points={
         'console_scripts': [
