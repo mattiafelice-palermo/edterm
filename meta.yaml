@@ -1,0 +1,37 @@
+{% set name = "edterm" %}
+{% set version = "0.1.0" %}
+
+package:
+  name: "{{ name|lower }}"
+  version: "{{ version }}"
+
+source:
+  url: https://github.com/mattiafelice-palermo/{{ name }}/archive/refs/tags/{{ version }}.zip
+
+build:
+  noarch: python
+  number: 0
+  script: "{{ PYTHON }} -m pip install . --no-deps --ignore-installed -vv" 
+
+requirements:
+  host:
+    - python >=3.7
+    - pip
+  run:
+    - python >=3.7
+    - pandas
+    - plotext
+    - conda-forge::panedr
+
+about:
+  home: https://github.com/mattiafelice-palermo/edterm
+  license: MIT
+  license_family: MIT
+  license_file: LICENSE
+  summary: "A terminal-based GROMACS EDR data plotting tool, enabling quick visualization directly from the command line."
+  doc_url: https://github.com/mattiafelice-palermo/edterm#readme
+  dev_url: https://github.com/mattiafelice-palermo/edterm
+
+extra:
+  recipe-maintainers:
+    - mattiafelice-palermo
