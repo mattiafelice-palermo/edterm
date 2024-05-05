@@ -6,7 +6,7 @@ package:
   version: "{{ version }}"
 
 source:
-  url: https://github.com/mattiafelice-palermo/{{ name }}/archive/refs/tags/v{{ version }}.zip
+  path: .
 
 build:
   noarch: python
@@ -19,7 +19,7 @@ requirements:
   run:
     - python >=3.7
     - pandas
-    - plotext
+    - conda-forge::plotext
     - conda-forge::panedr
 
 about:

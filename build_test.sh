@@ -2,7 +2,6 @@
 
 # Define the package name, version, and Python version
 PACKAGE_NAME="edterm"
-VERSION="0.1.0"
 PYTHON_VERSION="3.11"
 
 # Define the test environment name
@@ -106,7 +105,7 @@ pip install -e .
 echo -e "\n----- ${GREEN}Running pip package tests...${NC} -----"
 # Here you can add commands to run your tests, e.g., pytest
 
-echo -e "\n----- ${GREEN}Building and installing $PACKAGE_NAME for Conda...${NC} -----"
+echo -e "\n----- ${GREEN}Building $PACKAGE_NAME for Conda...${NC} -----"
 
 # Build the Conda package
 conda build .
@@ -114,6 +113,7 @@ conda build .
 # Find the package location
 CONDA_PACKAGE=$(conda build . --output)
 
+echo -e "\n----- ${GREEN} Installing $PACKAGE_NAME for Conda...${NC} -----"
 # Install the package into the current environment
 conda install --use-local $CONDA_PACKAGE -c conda-forge
 
