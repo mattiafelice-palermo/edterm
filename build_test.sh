@@ -115,7 +115,7 @@ conda build .
 CONDA_PACKAGE=$(conda build . --output)
 
 # Install the package into the current environment
-conda install --use-local $CONDA_PACKAGE
+conda install --use-local $CONDA_PACKAGE -c conda-forge
 
 echo -e "\n----- ${GREEN}Running Conda package tests...${NC} -----"
 # Similar to above, add commands to run your tests
