@@ -2,6 +2,9 @@
 
 `edterm` is a command-line interface (CLI) tool designed for plotting GROMACS EDR data directly in the terminal. This tool enables users to visualize data trends from simulation outputs without leaving the command line environment, providing a quick and interactive way to analyze simulation results.
 
+![image](https://github.com/mattiafelice-palermo/edterm/assets/12560118/2d4f3fda-3191-4f53-9402-ba8cca82df7b)
+
+
 ## Features
 
 - **Terminal-based Plotting**: Utilizes the terminal to plot data directly, making it accessible on systems without a graphical user interface or when forwarding X11 is impractical.
