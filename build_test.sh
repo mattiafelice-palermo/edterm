@@ -3,7 +3,7 @@
 # Define the package name, version, and Python version
 PACKAGE_NAME="edterm"
 VERSION="0.1.0"
-PYTHON_VERSION="3.7"
+PYTHON_VERSION="3.11"
 
 # Define the test environment name
 ENV_NAME="edterm-test_env"
