@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='edterm',
-    version='0.1.3',
+    version='0.1.4',
     packages=find_packages(),
     description='A terminal-based GROMACS EDR data plotting tool',
     long_description=open('README.md').read(),

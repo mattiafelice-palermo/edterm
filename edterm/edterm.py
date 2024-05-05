@@ -1,18 +1,26 @@
 import os
 import argparse
-import curses
 import pandas as pd
 from .data_reader import load_data
 import time
 import plotext
 import logging
+import locale
 
 def setup_environment():
     # Check and set environment variables for locale settings
     if os.environ.get('LANG', '') != 'en_US.UTF-8':
+        print("hmpg")
         os.environ['LANG'] = 'en_US.UTF-8'
     if os.environ.get('LC_ALL', '') != 'en_US.UTF-8':
         os.environ['LC_ALL'] = 'en_US.UTF-8'
+    # Set locale settings in the locale module
+    locale.setlocale(locale.LC_ALL, 'en_US.UTF-8')
+
+
+setup_environment()
+
+import curses
 
 def setup_logger():
     # Create a custom logger
@@ -116,11 +124,9 @@ def edterm_main(stdscr, args):
     input_mode = False
     resize_happened = True
     x_min, x_max = None, None
-    counter = 0
     number_buffer = ""
 
     while True:
-        counter += 1
         if input_mode:
             stdscr.nodelay(0)  # Switch to blocking mode for input
             stdscr.move(max_y-1, 0)
@@ -143,15 +149,12 @@ def edterm_main(stdscr, args):
 
         new_max_y, new_max_x = stdscr.getmaxyx()
         if new_max_y != max_y or new_max_x != max_x:
-            logger.info(f"Resize happend! {counter}")
             max_y, max_x = new_max_y, new_max_x
             first_draw = True
             resize_happend = True
             stdscr.clear()  # Clear the screen because the terminal size has changed
             stdscr.refresh()
 
-
-        if not resize_happened: logger.info(f"Resize status {resize_happened}, {counter}")
 
         # Draw static elements only if they need to be redrawn or once
         if first_draw:
@@ -180,7 +183,6 @@ def edterm_main(stdscr, args):
             plot_row = 4  # Starting row for plot
             stdscr.clrtobot()  # Clear from here to bottom of the screen
             for line in plot_lines:
-                logger.info(len(line))
                 if plot_row < max_y - 1:
                     parse_and_print_ansi(stdscr, plot_row, menu_width + 4, line)
                     plot_row += 1
