@@ -7,6 +7,19 @@ import plotext
 import logging
 import locale
 
+# Create a custom logger
+logger = logging.getLogger(__name__)
+# Create handlers
+logger_handler = logging.FileHandler('.edterm_debug.log')
+
+# Create formatters and add it to handlers
+f_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger_handler.setFormatter(f_format)
+
+# Add handlers to the logger
+logger.addHandler(logger_handler)
+
+
 def setup_environment():
     # Check and set environment variables for locale settings
     if os.environ.get('LANG', '') != 'en_US.UTF-8':
@@ -22,62 +35,92 @@ setup_environment()
 
 import curses
 
-def setup_logger():
-    # Create a custom logger
-    logger = logging.getLogger(__name__)
+def setup_logger(logger_level=logging.DEBUG):
+    # Map the string logging level to logging module levels
+    level_dict = {
+        'debug': logging.DEBUG,
+        'info': logging.INFO,
+        'warning': logging.WARNING,
+        'error': logging.ERROR,
+        'critical': logging.CRITICAL
+    }
+
+    # Get the logging level from the dictionary
+    log_level = level_dict.get(logger_level.lower(), logging.INFO)
 
     # Set the log level
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(log_level)
+    logger_handler.setLevel(log_level)
 
-    # Create handlers
-    f_handler = logging.FileHandler('debug.log')
-    f_handler.setLevel(logging.DEBUG)
-
-    # Create formatters and add it to handlers
-    f_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    f_handler.setFormatter(f_format)
-
-    # Add handlers to the logger
-    logger.addHandler(f_handler)
-
-    return logger
-
-def setup_colors():
+def setup_colors(theme):
     curses.start_color()
     curses.use_default_colors()
-    for i in range(0, curses.COLORS):
-        curses.init_pair(i + 1, i, -1)
 
-def parse_and_print_ansi(stdscr, y, x, ansi_string):
+    if theme == 'transparent':
+        background_color = -1
+    if theme == 'dark':
+        background_color = 16
+    if theme == 'light':
+        background_color = 15
+
+    for i in range(0, curses.COLORS):
+        curses.init_pair(i, i, background_color)
+
+def parse_and_print_ansi(stdscr, y, x, ansi_string, theme):
+    # TODO: could be made much better and support plotext themes, but for now it will do
     import re
     ansi_escape = re.compile(r'\x1b\[([0-9;]*)m')
     pieces = ansi_escape.split(ansi_string)
     x_offset = 0
 
-    while pieces:
-        text = pieces.pop(0)
-        stdscr.addstr(y, x + x_offset, text)
-        x_offset += len(text)
+    clean_list = remove_consecutive_elements(pieces, ['', '48;5;15', ''])
+    elements = [element for element in clean_list if element != '']
 
-        if pieces:
-            codes = pieces.pop(0)
-            # Apply the ANSI codes as curses attributes or colors
-            for code in codes.split(';'):
-                if code == "0":  # Reset
-                    stdscr.attroff(curses.color_pair(1))
-                    stdscr.attrset(curses.A_NORMAL)
-                elif code.startswith("38;5;"):  # Foreground Color
-                    color_number = int(code[5:])
-                    stdscr.attron(curses.color_pair(color_number + 1))
-                elif code.startswith("48;5;"):  # Background Color
-                    color_number = int(code[5:])
-                    stdscr.attron(curses.color_pair(color_number + 1))
-                # Add more cases as needed
+    x_offset = 0
+    if theme == 'transparent':
+        color_1 = 0
+        color_2 = 11 # Main observable
+        color_3 = 15
+        color_4 = 15
+    if theme == 'dark':
+        color_1 = 15
+        color_2 = 15
+        color_3 = 156
+        color_4 = 156
+    if theme == 'light':    
+        color_1 = 232
+        color_2 = 4
+        color_3 = 156
+        color_4 = 8
+
+    while elements:
+        # Extract color code
+        code = elements.pop(0)
+        element = elements.pop(0)
+        end = elements.pop(0)
+
+        #logger.info(f"Text: {element} Code: {code}")
+
+        if code.startswith("38;5;0"):
+            color_pair = curses.color_pair(color_1)
+        if code == "38;5;12":
+            color_pair = curses.color_pair(color_2)
+        if code.startswith("48;5;"):
+            color_pair = curses.color_pair(color_3)
+        if code == "38;5;10":
+            color_pair = curses.color_pair(color_4)
+
+        # Add text with the specific color pair directly
+        stdscr.addstr(y, x + x_offset, element, color_pair)
+        x_offset += len(element)
 
 def calculate_moving_average(df, column, window=50):
     return df[column].rolling(window=window, min_periods=1).mean()
 
-def plot_ascii(df, column, width, height, x_min = None, x_max = None):
+def calculate_expanding_average(df, column):
+    return df[column].expanding().mean()
+
+def plot_ascii(df, column, width, height, x_min = None, x_max = None, stride=1):
     # Clear previous plots
     plotext.clf()
 
@@ -90,11 +133,20 @@ def plot_ascii(df, column, width, height, x_min = None, x_max = None):
     else:
         filtered_df = df
 
+    # Apply stride to reduce the number of data points plotted
+    if not filtered_df.empty:
+        filtered_df = filtered_df.iloc[::stride]  # This skips data points
+
+    moving_avg = calculate_expanding_average(filtered_df, column)
+
     # Plot data
     if not filtered_df.empty:
-        plotext.plot(filtered_df['Time'], filtered_df[column])
+        plotext.plot(filtered_df['Time'], filtered_df[column], label=f"{column}")
     else:
         plotext.plot(df['Time'], df[column])  # fallback if the filter results in no data
+
+    # Plot the moving average data
+    plotext.plot(filtered_df['Time'], moving_avg, label=f"Moving Average of {column}")
 
     plotext.title(f"{column} over Time")
     plotext.xlabel("Time (ps)")
@@ -107,14 +159,13 @@ def plot_ascii(df, column, width, height, x_min = None, x_max = None):
 
 def edterm_main(stdscr, args):
     setup_environment()  # Ensure environment variables are correctly set
-    logger = setup_logger()
     curses.curs_set(0)
-    setup_colors()
+    setup_colors(args.theme)
     stdscr.nodelay(1)
     stdscr.clear()
 
     df = load_data(args.file)
-    columns = list(df.columns) if not df.empty else []
+    columns = list(df.columns[1:]) if not df.empty else []
     current_index = 0
     last_index = -1  # Initialize to force redraw on first loop
     max_y, max_x = stdscr.getmaxyx()  # Initial size
@@ -179,18 +230,18 @@ def edterm_main(stdscr, args):
             last_index = current_index
             plot_width = max_x - menu_width - 5  # Calculate available width for plot
             plot_height = max_y - 5  # Calculate available height for plot
-            plot_lines = plot_ascii(df, columns[current_index], plot_width, plot_height, x_min, x_max)
+            plot_lines = plot_ascii(df, columns[current_index], plot_width, plot_height, x_min, x_max, args.stride)
             plot_row = 4  # Starting row for plot
             stdscr.clrtobot()  # Clear from here to bottom of the screen
             for line in plot_lines:
                 if plot_row < max_y - 1:
-                    parse_and_print_ansi(stdscr, plot_row, menu_width + 4, line)
+                    parse_and_print_ansi(stdscr, plot_row, menu_width + 4, line, args.theme)
                     plot_row += 1
             resize_happened = False
 
         stdscr.noutrefresh()
         curses.doupdate()
-        curses.napms(10)  # Smoother refresh rate
+        #curses.napms(10)  # Smoother refresh rate
 
         k = stdscr.getch()
 
@@ -211,12 +262,6 @@ def edterm_main(stdscr, args):
                 break  # Quit on 'q'
             if char == 'r':
                 input_mode = True
-        if time.time() - last_number_time > 0.5:
-            if number_buffer:
-                number = int(number_buffer) - 1
-                if 0 <= number < len(columns):
-                    current_index = number
-                    number_buffer = ""
 
         if k == curses.KEY_UP and current_index > 0:
             current_index -= 1  # Move selection up
@@ -225,10 +270,41 @@ def edterm_main(stdscr, args):
 
 def main():
     parser = argparse.ArgumentParser(description='GROMACS Data Plotter Tool')
+    
+    # Add the path to the GROMACS EDR file argument
     parser.add_argument('file', type=str, help='Path to the GROMACS EDR file')
+    
+    # Add an optional argument for stride with default value of 1
+    parser.add_argument('--stride', '-s', type=int, default=1, help='Stride for data plotting to reduce plot density')
+    
+    # Add an optional argument for setting logging level
+    parser.add_argument('--logging-level', '-ll', type=str, default='info', choices=['debug', 'info', 'warning', 'error', 'critical'],
+                        help='Set logger level')
+    
+    # Add an optional argument for setting color theme
+    parser.add_argument('--theme', '-t', type=str, default='transparent', choices=['dark', 'light', 'transparent'], help='Set the color theme')
+
     args = parser.parse_args()
+
+    setup_logger(args.logging_level)
     
     curses.wrapper(edterm_main, args)
 
 if __name__ == '__main__':
     main()
+
+def remove_consecutive_elements(source_list, elements_to_remove):
+    n = len(source_list)
+    m = len(elements_to_remove)
+    i = 0
+    result = []
+    
+    while i < n:
+        # Check if the current slice matches the elements_to_remove
+        if i <= n - m and source_list[i:i+m] == elements_to_remove:
+            i += m  # Skip the next m elements
+        else:
+            result.append(source_list[i])
+            i += 1
+    
+    return result

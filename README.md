@@ -4,17 +4,21 @@
 
 ## Features
 
-- **Terminal-based Plotting**: Utilizes the terminal to plot data directly, making it accessible on systems without a graphical user interface or when forwarding X11 is impractical..
+- **Terminal-based Plotting**: Utilizes the terminal to plot data directly, making it accessible on systems without a graphical user interface or when forwarding X11 is impractical.
+- **Themes**: Offers three themes—transparent, dark, and light—to accommodate different viewing preferences and terminal settings.
 - **Interactive Navigation**: Users can navigate through different data contained in the EDR file using keyboard inputs.
 - **Dynamic Time Window Adjustment**: Offers the ability to focus on specific time windows by entering desired time ranges.
 - **Resizable Interface**: Automatically adjusts the plot and interface when the terminal size changes.
+- **Stride for Data Reduction**: Introduces a stride option to reduce the amount of data processed, enhancing performance for large datasets.
+- **Expanding Average Plot**: Plots the expanding average to provide additional analytical insight.
 - **Keyboard Controls**: Simple keyboard controls for navigating and interacting with the data.
+- **Configurable Logging Level**: Users can set the logging level through command-line options to tailor logging verbosity.
 
 ## Installation
 
 To install `edterm`, run the following command:
 
-```bash
+```
 pip install edterm
 ```
 
@@ -24,8 +28,8 @@ This command will download and install `edterm` along with its necessary depende
 
 Once installed, you can run `edterm` using the following command:
 
-```bash
-edterm <path_to_your_edr_file.edr>
+```
+edterm <path_to_your_edr_file.edr> [--stride <stride_value>] [--theme {transparent,dark,light}] [--logging-level {debug,info,warning,error,critical}]
 ```
 
 Replace `<path_to_your_edr_file.edr>` with the actual path to your GROMACS EDR file.
