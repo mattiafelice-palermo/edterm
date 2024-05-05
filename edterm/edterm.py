@@ -1,3 +1,4 @@
+import os
 import argparse
 import curses
 import pandas as pd
@@ -5,6 +6,13 @@ from .data_reader import load_data
 import time
 import plotext
 import logging
+
+def setup_environment():
+    # Check and set environment variables for locale settings
+    if os.environ.get('LANG', '') != 'en_US.UTF-8':
+        os.environ['LANG'] = 'en_US.UTF-8'
+    if os.environ.get('LC_ALL', '') != 'en_US.UTF-8':
+        os.environ['LC_ALL'] = 'en_US.UTF-8'
 
 def setup_logger():
     # Create a custom logger
@@ -90,6 +98,7 @@ def plot_ascii(df, column, width, height, x_min = None, x_max = None):
 
 
 def edterm_main(stdscr, args):
+    setup_environment()  # Ensure environment variables are correctly set
     logger = setup_logger()
     curses.curs_set(0)
     setup_colors()

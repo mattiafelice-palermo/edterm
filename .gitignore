@@ -148,6 +148,10 @@ dmypy.json
 
 # pytype static type analyzer
 .pytype/
+\#*
+
+#.pypirc
+.pypirc
 
 # Cython debug symbols
 cython_debug/
