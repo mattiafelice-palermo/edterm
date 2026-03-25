@@ -12,7 +12,7 @@ import time
 import pandas as pd
 import plotext
 
-from .data_reader import load_data
+from .data_reader import load_data, load_units
 
 
 logger = logging.getLogger(__name__)
@@ -23,6 +23,13 @@ logger.addHandler(logger_handler)
 ANSI_ESCAPE = re.compile(r'\x1b\[([0-9;]*)m')
 PERCENT_RE = re.compile(r'(\d{1,3}(?:\.\d+)?)\s*%')
 AUTO_STRIDE_OVERSAMPLE_FACTOR = 3
+TIME_UNIT_FACTORS_PS = {
+    'fs': 0.001,
+    'ps': 1.0,
+    'ns': 1000.0,
+    'ms': 1_000_000_000.0,
+}
+TIME_UNIT_CYCLE = ['auto', 'fs', 'ps', 'ns', 'ms']
 
 
 def setup_environment():
@@ -147,6 +154,14 @@ def _safe_addstr(stdscr, y, x, text, color_pair=None):
         return
 
 
+def _clear_region(stdscr, top, left, height, width):
+    if height <= 0 or width <= 0:
+        return
+    blank = ' ' * width
+    for y in range(top, top + height):
+        _safe_addstr(stdscr, y, left, blank)
+
+
 def _color_for_ansi_code(code, theme_color_ids, default_pair):
     if not code:
         return default_pair
@@ -163,7 +178,7 @@ def _color_for_ansi_code(code, theme_color_ids, default_pair):
     return default_pair
 
 
-def parse_and_print_ansi(stdscr, y, x, ansi_string, theme):
+def parse_and_print_ansi(stdscr, y, x, ansi_string, theme, extra_attr=0):
     theme_color_ids = _theme_color_ids(theme)
     default_pair = _safe_color_pair(theme_color_ids['default'])
 
@@ -176,7 +191,7 @@ def parse_and_print_ansi(stdscr, y, x, ansi_string, theme):
 
     first_text = pieces[0]
     if first_text:
-        _safe_addstr(stdscr, y, x + x_offset, first_text, current_pair)
+        _safe_addstr(stdscr, y, x + x_offset, first_text, current_pair | extra_attr)
         x_offset += len(first_text)
 
     index = 1
@@ -186,14 +201,24 @@ def parse_and_print_ansi(stdscr, y, x, ansi_string, theme):
         current_pair = _color_for_ansi_code(code, theme_color_ids, default_pair)
 
         if text:
-            _safe_addstr(stdscr, y, x + x_offset, text, current_pair)
+            _safe_addstr(stdscr, y, x + x_offset, text, current_pair | extra_attr)
             x_offset += len(text)
 
         index += 2
 
 
-def calculate_expanding_average(df, column):
-    return df[column].expanding().mean()
+def _adaptive_centered_window(num_points):
+    if num_points <= 2:
+        return 1
+    window = max(5, min(301, num_points // 25))
+    if window % 2 == 0:
+        window += 1
+    return min(window, num_points if num_points % 2 == 1 else max(1, num_points - 1))
+
+
+def calculate_centered_moving_average(df, column):
+    window = _adaptive_centered_window(len(df))
+    return df[column].rolling(window=window, center=True, min_periods=1).mean()
 
 
 def range_has_data(df, x_min, x_max):
@@ -362,7 +387,7 @@ def _render_loading_box(stdscr, menu_width, max_x, max_y, elapsed_seconds, progr
         _safe_addstr(stdscr, center_y + 3, plot_left, hint[: max(0, box_width - 1)])
 
 
-def plot_ascii(df, column, width, height, x_min=None, x_max=None, stride=1, auto_stride_enabled=True):
+def plot_ascii(df, column, units, width, height, x_min=None, x_max=None, stride=1, auto_stride_enabled=True, time_unit_mode='auto'):
     if width <= 0 or height <= 0:
         return ['Terminal too small to render plot.'], 1, 0, 0, 'raw'
 
@@ -389,20 +414,172 @@ def plot_ascii(df, column, width, height, x_min=None, x_max=None, stride=1, auto
         effective_stride = max(1, stride)
         filtered_df = visible_df.iloc[::effective_stride] if total_visible_points > 0 else visible_df
 
-    moving_avg = calculate_expanding_average(filtered_df, column) if not filtered_df.empty else None
+    moving_avg = calculate_centered_moving_average(filtered_df, column) if not filtered_df.empty else None
 
     if not filtered_df.empty:
-        plotext.plot(filtered_df['Time'], filtered_df[column], label=column)
-        if moving_avg is not None:
-            plotext.plot(filtered_df['Time'], moving_avg, label=f'Moving Average of {column}')
+        time_scale, time_unit = _time_axis_config(filtered_df['Time'], time_unit_mode)
+        x_values = filtered_df['Time'] / time_scale
     else:
-        plotext.plot(df['Time'], df[column], label=column)
+        time_scale, time_unit = _time_axis_config(df['Time'], time_unit_mode)
+        x_values = df['Time'] / time_scale
 
-    plotext.title(f'{column} over Time')
-    plotext.xlabel('Time (ps)')
-    plotext.ylabel(column)
+    if not filtered_df.empty:
+        plotext.plot(x_values, filtered_df[column], label=column)
+        if moving_avg is not None:
+            plotext.plot(x_values, moving_avg, label=f'Centered MA of {column}')
+    else:
+        plotext.plot(x_values, df[column], label=column)
+
+    y_label = _column_with_unit(column, units)
+    plotext.title(f'{y_label} over Time')
+    plotext.xlabel(f'Time ({time_unit})')
+    plotext.ylabel(y_label)
 
     return plotext.build().split('\n'), effective_stride, len(filtered_df), total_visible_points, sampling_mode
+
+
+def _prepare_trend_df(df, column, x_min, x_max, stride, auto_stride_enabled, target_width):
+    if x_min is not None and x_max is not None:
+        visible_df = df[(df['Time'] >= x_min) & (df['Time'] <= x_max)]
+    else:
+        visible_df = df
+
+    if visible_df.empty or column not in visible_df:
+        return pd.DataFrame(columns=['Time', 'Trend']), 0, 0
+
+    working_df = visible_df[['Time', column]].dropna()
+    total_visible_points = len(working_df)
+    if total_visible_points == 0:
+        return pd.DataFrame(columns=['Time', 'Trend']), 0, 0
+
+    if auto_stride_enabled:
+        target_points = max(1, target_width * 2)
+        sampled_df = downsample_minmax_by_chunks(working_df, column, target_points)
+        if stride > 1 and not sampled_df.empty:
+            sampled_df = sampled_df.iloc[::stride]
+    else:
+        sampled_df = working_df.iloc[::max(1, stride)]
+
+    if sampled_df.empty:
+        return pd.DataFrame(columns=['Time', 'Trend']), 0, total_visible_points
+
+    trend = calculate_centered_moving_average(sampled_df, column)
+    trend_df = pd.DataFrame({'Time': sampled_df['Time'], 'Trend': trend}).dropna()
+    return trend_df, len(sampled_df), total_visible_points
+
+
+def _time_axis_config(time_series, unit_mode='auto'):
+    if time_series is None or len(time_series) == 0:
+        return 1.0, 'ps'
+    if unit_mode in TIME_UNIT_FACTORS_PS:
+        return TIME_UNIT_FACTORS_PS[unit_mode], unit_mode
+    max_time = float(time_series.max())
+    if max_time < 1000.0:
+        return 1.0, 'ps'
+    return 1000.0, 'ns'
+
+
+def _column_with_unit(column, units):
+    if not units:
+        return column
+    unit = units.get(column)
+    if unit:
+        return f'{column} ({unit})'
+    return column
+
+
+def _build_overview_panel_lines(trend_df, display_label, base_column, width, height, units, time_unit_mode):
+    if width <= 0 or height <= 0:
+        return ['']
+    if trend_df.empty:
+        return ['No data']
+
+    plotext.clf()
+    plotext.plotsize(width, height)
+    time_scale, time_unit = _time_axis_config(trend_df['Time'], time_unit_mode)
+    x_values = trend_df['Time'] / time_scale
+    plotext.plot(x_values, trend_df['Trend'])
+    panel_label = _column_with_unit(base_column, units)
+    if display_label:
+        panel_label = f'{display_label} {panel_label}'
+    plotext.title(panel_label[: max(1, width - 2)])
+    plotext.xlabel(f'Time ({time_unit})')
+    plotext.ylabel('')
+    return plotext.build().split('\n')
+
+
+def draw_overview(stdscr, df, columns, units, menu_width, max_x, max_y, x_min, x_max, stride, auto_stride_enabled, page, theme, time_unit_mode):
+    plot_left = menu_width + 4
+    plot_width = max_x - menu_width - 5
+    plot_height = max_y - 5
+
+    if plot_width <= 30 or plot_height <= 12:
+        return 'Terminal is too small for overview.', 0, 0
+
+    n_cols = 2
+    n_rows = 3
+    per_page = 6
+    total_pages = max(1, math.ceil(len(columns) / per_page))
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * per_page
+    shown_columns = columns[start_idx:start_idx + per_page]
+
+    cell_w = max(14, plot_width // n_cols)
+    cell_h = max(8, plot_height // n_rows)
+
+    _clear_region(stdscr, 4, plot_left, plot_height, plot_width)
+
+    plotted_count = 0
+    no_data_count = 0
+    for local_idx, column in enumerate(shown_columns):
+        absolute_idx = start_idx + local_idx
+        grid_row = local_idx // n_cols
+        grid_col = local_idx % n_cols
+
+        x0 = plot_left + (grid_col * cell_w)
+        y0 = 4 + (grid_row * cell_h)
+        panel_w = max(10, cell_w - 1)
+        panel_h = max(6, cell_h - 1)
+
+        trend_df, _, _ = _prepare_trend_df(
+            df,
+            column,
+            x_min,
+            x_max,
+            stride,
+            auto_stride_enabled,
+            panel_w,
+        )
+        panel_lines = _build_overview_panel_lines(
+            trend_df,
+            f'{absolute_idx + 1}.',
+            column,
+            panel_w,
+            panel_h,
+            units,
+            time_unit_mode,
+        )
+
+        if trend_df.empty:
+            no_data_count += 1
+        else:
+            plotted_count += 1
+
+        row_ptr = y0
+        for line in panel_lines:
+            if row_ptr >= max_y - 1:
+                break
+            # Do not slice raw ANSI strings; slicing can break escape sequences.
+            line_attr = curses.A_BOLD if row_ptr == y0 else 0
+            parse_and_print_ansi(stdscr, row_ptr, x0, line, theme, extra_attr=line_attr)
+            row_ptr += 1
+
+    info = (
+        f'Overview page {page + 1}/{total_pages} '
+        f'({len(shown_columns)} shown, trend={plotted_count}, no-data={no_data_count}) '
+        f'- LEFT/RIGHT pages'
+    )
+    return info, plotted_count, total_pages
 
 
 def edterm_main(stdscr, args, preloaded_df=None):
@@ -416,6 +593,7 @@ def edterm_main(stdscr, args, preloaded_df=None):
 
     data_ready = preloaded_df is not None
     df = preloaded_df
+    units = getattr(args, '_preloaded_units', {}) if data_ready else {}
     columns = list(df.columns[1:]) if data_ready else []
 
     if not data_ready:
@@ -456,6 +634,7 @@ def edterm_main(stdscr, args, preloaded_df=None):
             stderr_sink=None,
             progress_callback=progress_callback,
         )
+        loaded_units = load_units(args.file)
         draw_loading_snapshot(force=True)
         validation_error = validate_loaded_dataframe(loaded_df)
         if validation_error:
@@ -464,6 +643,7 @@ def edterm_main(stdscr, args, preloaded_df=None):
             plot_info_message = ''
         else:
             df = loaded_df
+            units = loaded_units if isinstance(loaded_units, dict) else {}
             columns = list(df.columns[1:])
             data_ready = True
             first_draw = True
@@ -475,7 +655,7 @@ def edterm_main(stdscr, args, preloaded_df=None):
     last_index = -1
     first_draw = True
     last_number_time = time.time()
-    input_mode = False
+    input_mode = None
     resize_happened = True
     range_changed = True
     x_min, x_max = None, None
@@ -483,9 +663,13 @@ def edterm_main(stdscr, args, preloaded_df=None):
     status_message = ''
     plot_info_message = ''
     load_error_message = ''
+    overview_page = 0
+    overview_total_pages = 1
+    current_stride = args.stride
+    time_unit_mode = 'auto'
 
     while True:
-        if input_mode:
+        if input_mode == 'range':
             stdscr.nodelay(0)
             _safe_addstr(stdscr, max_y - 1, 0, 'Provide the desired time window (x_min x_max): ')
             stdscr.clrtoeol()
@@ -515,7 +699,29 @@ def edterm_main(stdscr, args, preloaded_df=None):
                 status_message = 'Invalid input. Enter two numbers with x_min <= x_max.'
 
             curses.noecho()
-            input_mode = False
+            input_mode = None
+            stdscr.nodelay(1)
+        elif input_mode == 'stride':
+            stdscr.nodelay(0)
+            _safe_addstr(stdscr, max_y - 1, 0, f'Provide stride (>=1), current {current_stride}: ')
+            stdscr.clrtoeol()
+            curses.echo()
+            try:
+                input_raw = stdscr.getstr(max_y - 1, 45)
+                input_str = input_raw.decode('utf-8').strip()
+            except Exception:
+                input_str = ''
+            try:
+                new_stride = int(input_str)
+                if new_stride < 1:
+                    raise ValueError('Stride must be >=1')
+                current_stride = new_stride
+                range_changed = True
+                status_message = f'Stride set to {current_stride}'
+            except ValueError:
+                status_message = 'Invalid stride. Enter an integer >= 1.'
+            curses.noecho()
+            input_mode = None
             stdscr.nodelay(1)
 
         new_max_y, new_max_x = stdscr.getmaxyx()
@@ -529,14 +735,18 @@ def edterm_main(stdscr, args, preloaded_df=None):
         if first_draw:
             _safe_addstr(stdscr, 0, 0, 'Welcome to the GROMACS Data Plotter Tool')
             _safe_addstr(stdscr, 1, 0, f'File: {args.file}')
-            _safe_addstr(stdscr, 2, 0, "Press 'q' to quit. Use UP/DOWN arrows or type numbers to select.")
+            _safe_addstr(stdscr, 2, 0, "q quit | arrows select | r range | s stride | u unit | L/R overview pages")
             first_draw = False
 
         menu_row = 4
+        if menu_row < max_y:
+            overview_mode = curses.A_REVERSE if current_index == 0 else curses.A_NORMAL
+            _safe_addstr(stdscr, menu_row, 0, '0. Overview'.ljust(menu_width), overview_mode)
         for i, col in enumerate(columns):
-            if menu_row + i < max_y:
-                mode = curses.A_REVERSE if i == current_index else curses.A_NORMAL
-                _safe_addstr(stdscr, menu_row + i, 0, f'{i + 1}. {col}'.ljust(menu_width), mode)
+            row = menu_row + 1 + i
+            if row < max_y:
+                mode = curses.A_REVERSE if (i + 1) == current_index else curses.A_NORMAL
+                _safe_addstr(stdscr, row, 0, f'{i + 1}. {col}'.ljust(menu_width), mode)
 
         for y in range(4, max_y - 1):
             try:
@@ -571,29 +781,50 @@ def edterm_main(stdscr, args, preloaded_df=None):
                 status_message = 'Data not available for plotting.'
             else:
                 try:
-                    plot_lines, effective_stride, plotted_points, total_visible_points, sampling_mode = plot_ascii(
-                        df,
-                        columns[current_index],
-                        plot_width,
-                        plot_height,
-                        x_min,
-                        x_max,
-                        args.stride,
-                        not args.no_auto_stride,
-                    )
-                    plot_row = 4
-                    for line in plot_lines:
-                        if plot_row < max_y - 1:
-                            parse_and_print_ansi(stdscr, plot_row, menu_width + 4, line, args.theme)
-                            plot_row += 1
-                    auto_mode = 'on' if not args.no_auto_stride else 'off'
-                    plot_info_message = (
-                        f'Rendering {plotted_points}/{total_visible_points} points '
-                        f'(mode={sampling_mode}, stride={effective_stride}, requested={args.stride}, auto={auto_mode})'
-                    )
+                    if current_index == 0:
+                        plot_info_message, _, overview_total_pages = draw_overview(
+                            stdscr,
+                            df,
+                            columns,
+                            units,
+                            menu_width,
+                            max_x,
+                            max_y,
+                            x_min,
+                            x_max,
+                            current_stride,
+                            not args.no_auto_stride,
+                            overview_page,
+                            args.theme,
+                            time_unit_mode,
+                        )
+                    else:
+                        selected_column = columns[current_index - 1]
+                        plot_lines, effective_stride, plotted_points, total_visible_points, sampling_mode = plot_ascii(
+                            df,
+                            selected_column,
+                            units,
+                            plot_width,
+                            plot_height,
+                            x_min,
+                            x_max,
+                            current_stride,
+                            not args.no_auto_stride,
+                            time_unit_mode,
+                        )
+                        plot_row = 4
+                        for line in plot_lines:
+                            if plot_row < max_y - 1:
+                                parse_and_print_ansi(stdscr, plot_row, menu_width + 4, line, args.theme)
+                                plot_row += 1
+                        auto_mode = 'on' if not args.no_auto_stride else 'off'
+                        plot_info_message = (
+                            f'Rendering {plotted_points}/{total_visible_points} points '
+                            f'(mode={sampling_mode}, stride={effective_stride}, set={current_stride}, auto={auto_mode}, unit={time_unit_mode})'
+                        )
                     status_message = ''
                 except Exception:
-                    logger.exception('Failed to render plot for column %s', columns[current_index])
+                    logger.exception('Failed to render plot for selection %s', current_index)
                     plot_info_message = ''
                     status_message = 'Plot rendering failed. See .edterm_debug.log for details.'
 
@@ -629,18 +860,33 @@ def edterm_main(stdscr, args, preloaded_df=None):
             if char.isdigit():
                 number_buffer += char
                 last_number_time = time.time()
-                number = int(number_buffer) - 1
-                if 0 <= number < len(columns):
+                number = int(number_buffer)
+                if 0 <= number <= len(columns):
                     current_index = number
             elif char == 'q':
                 break
             elif char == 'r' and data_ready:
-                input_mode = True
+                input_mode = 'range'
+            elif char == 's' and data_ready:
+                input_mode = 'stride'
+            elif char == 'u':
+                current_idx = TIME_UNIT_CYCLE.index(time_unit_mode) if time_unit_mode in TIME_UNIT_CYCLE else 0
+                time_unit_mode = TIME_UNIT_CYCLE[(current_idx + 1) % len(TIME_UNIT_CYCLE)]
+                range_changed = True
+                status_message = f'Time unit mode: {time_unit_mode}'
 
         if k == curses.KEY_UP and current_index > 0:
             current_index -= 1
-        elif k == curses.KEY_DOWN and current_index < len(columns) - 1:
+            if current_index == 0:
+                range_changed = True
+        elif k == curses.KEY_DOWN and current_index < len(columns):
             current_index += 1
+        elif k == curses.KEY_LEFT and current_index == 0 and overview_page > 0:
+            overview_page -= 1
+            range_changed = True
+        elif k == curses.KEY_RIGHT and current_index == 0 and overview_page < (overview_total_pages - 1):
+            overview_page += 1
+            range_changed = True
 
 
 def main():
@@ -694,10 +940,13 @@ def main():
             curses.wrapper(edterm_main, args, None)
         else:
             loaded_df = load_data(args.file, verbose=False, stderr_sink=None)
+            loaded_units = load_units(args.file)
             validation_error = validate_loaded_dataframe(loaded_df)
             if validation_error:
                 print(f'Error: {validation_error}', file=sys.stderr)
                 return 1
+            # Store preloaded units in args for initial non-progress startup.
+            args._preloaded_units = loaded_units if isinstance(loaded_units, dict) else {}
             curses.wrapper(edterm_main, args, loaded_df)
     except Exception:
         logger.exception('Fatal UI error')

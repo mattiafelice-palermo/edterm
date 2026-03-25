@@ -50,3 +50,17 @@ def load_data(file_path, verbose=False, stderr_sink=None, progress_callback=None
     except Exception as exc:
         print(f'Error reading file: {exc}', file=sys.stderr)
         return pd.DataFrame()  # return empty dataframe on failure
+
+
+def load_units(file_path):
+    try:
+        local_pyedr = _get_local_pyedr_module()
+        if local_pyedr is not None:
+            return local_pyedr.get_unit_dictionary(file_path)
+
+        import panedr
+        if hasattr(panedr, 'get_unit_dictionary'):
+            return panedr.get_unit_dictionary(file_path)
+    except Exception:
+        return {}
+    return {}
