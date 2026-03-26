@@ -27,6 +27,15 @@ _RUST_EDR_MODULE = None
 logger = logging.getLogger('edterm.edterm')
 
 
+def _safe_call(callback, *args):
+    if callback is None:
+        return
+    try:
+        callback(*args)
+    except Exception:
+        return
+
+
 def _get_local_pyedr_module():
     global _LOCAL_PYEDR_MODULE
     if _LOCAL_PYEDR_MODULE is not None:
@@ -261,6 +270,110 @@ def load_units(file_path, use_cache=True):
         return {}
     _log_timing('load_units.empty', t0)
     return {}
+
+
+def stream_data(
+    file_path,
+    frame_stride=1,
+    batch_size=2000,
+    progress_stride=1000,
+    on_metadata=None,
+    on_batch=None,
+    on_progress=None,
+    on_complete=None,
+    stop_event=None,
+):
+    """
+    Experimental streaming parser for progressive UI updates.
+
+    Uses local pyedr EDRFile iteration when available. Falls back to one-shot
+    load_data/load_units if streaming parser is unavailable.
+    """
+    try:
+        file_path = str(Path(file_path).resolve())
+        frame_stride = max(1, int(frame_stride))
+        batch_size = max(1, int(batch_size))
+        progress_stride = max(1, int(progress_stride))
+
+        local_pyedr = _get_local_pyedr_module()
+        if local_pyedr is None or not hasattr(local_pyedr, 'EDRFile'):
+            data = load_data(file_path, frame_stride=frame_stride, use_cache=False)
+            units = load_units(file_path, use_cache=False)
+            columns = list(data.get('columns', []))
+            total_bytes = int(os.path.getsize(file_path))
+            _safe_call(on_metadata, columns, units, total_bytes)
+            _safe_call(
+                on_batch,
+                np.asarray(data.get('time', np.array([], dtype=np.float64)), dtype=np.float64),
+                data.get('values', {}),
+                int(len(data.get('time', []))),
+                total_bytes,
+                total_bytes,
+            )
+            _safe_call(on_progress, total_bytes, total_bytes, int(len(data.get('time', []))))
+            _safe_call(on_complete, None)
+            return
+
+        edr_file = local_pyedr.EDRFile(file_path)
+        total_bytes = int(len(edr_file.data.get_buffer()))
+        columns = [nm.name for nm in edr_file.nms]
+        units = {'Time': 'ps'}
+        for nm in edr_file.nms:
+            units[nm.name] = getattr(nm, 'unit', '')
+        _safe_call(on_metadata, columns, units, total_bytes)
+
+        batch_times = []
+        batch_values = {col: [] for col in columns}
+        frame_count = 0
+        kept_count = 0
+
+        for frame in edr_file:
+            if stop_event is not None and stop_event.is_set():
+                _safe_call(on_complete, 'stopped')
+                return
+
+            keep = (frame_count % frame_stride) == 0 and getattr(frame, 'ener', None)
+            if keep:
+                batch_times.append(float(frame.t))
+                for idx, col in enumerate(columns):
+                    if idx < len(frame.ener):
+                        batch_values[col].append(float(frame.ener[idx].e))
+                    else:
+                        batch_values[col].append(float('nan'))
+                kept_count += 1
+
+            frame_count += 1
+            if frame_count == 1 or frame_count % progress_stride == 0:
+                bytes_read = int(edr_file.data.get_position())
+                _safe_call(on_progress, bytes_read, total_bytes, frame_count)
+
+            if len(batch_times) >= batch_size:
+                _safe_call(
+                    on_batch,
+                    np.asarray(batch_times, dtype=np.float64),
+                    {k: np.asarray(v, dtype=np.float64) for k, v in batch_values.items()},
+                    kept_count,
+                    int(edr_file.data.get_position()),
+                    total_bytes,
+                )
+                batch_times = []
+                batch_values = {col: [] for col in columns}
+
+        if batch_times:
+            _safe_call(
+                on_batch,
+                np.asarray(batch_times, dtype=np.float64),
+                {k: np.asarray(v, dtype=np.float64) for k, v in batch_values.items()},
+                kept_count,
+                total_bytes,
+                total_bytes,
+            )
+        _safe_call(on_progress, total_bytes, total_bytes, frame_count)
+        _safe_call(on_complete, None)
+    except Exception as exc:
+        logger.exception('stream_data failed')
+        _safe_call(on_complete, f'{exc}')
+        return
 
 
 def _get_rust_edr_module():

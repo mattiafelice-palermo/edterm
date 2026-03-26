@@ -4,6 +4,7 @@ import locale
 import logging
 import math
 import os
+import queue
 import re
 import sys
 import threading
@@ -13,7 +14,7 @@ from collections import deque
 import numpy as np
 import plotext
 
-from .data_reader import load_data, load_units
+from .data_reader import load_data, load_units, stream_data
 
 
 logger = logging.getLogger(__name__)
@@ -253,15 +254,16 @@ def _compute_trend_for_column(df, column):
 
 
 def _get_or_compute_trend(df, column, trend_cache, trend_cache_lock):
+    expected_len = int(np.asarray(df.get('time', np.array([], dtype=np.float64))).shape[0])
     with trend_cache_lock:
         cached = trend_cache.get(column)
-    if cached is not None:
+    if cached is not None and int(np.asarray(cached).shape[0]) == expected_len:
         return cached
 
     trend = _compute_trend_for_column(df, column)
     with trend_cache_lock:
         existing = trend_cache.get(column)
-        if existing is not None:
+        if existing is not None and int(np.asarray(existing).shape[0]) == expected_len:
             return existing
         trend_cache[column] = trend
     return trend
@@ -549,7 +551,10 @@ def plot_ascii(
     if x_visible.size > 0:
         if trend_series is None:
             trend_series = _compute_trend_for_column(df, column)
-        trend_visible = np.asarray(trend_series, dtype=np.float64)[visible_mask]
+        trend_arr = np.asarray(trend_series, dtype=np.float64)
+        if trend_arr.shape[0] != time_values.shape[0]:
+            trend_arr = _compute_trend_for_column(df, column)
+        trend_visible = trend_arr[visible_mask]
         trend_visible = trend_visible[finite_visible]
         trend_finite = np.isfinite(trend_visible)
         trend_x = x_visible[trend_finite]
@@ -582,6 +587,57 @@ def plot_ascii(
     return plotext.build().split('\n'), effective_stride, filtered_x.size, total_visible_points, sampling_mode, stats
 
 
+def plot_histogram(df, column, units, width, height, x_min=None, x_max=None, visible_mask=None):
+    if width <= 0 or height <= 0:
+        return ['Terminal too small to render plot.'], 0, 0, 'hist', None
+
+    plotext.clf()
+    plotext.plotsize(width, height)
+
+    time_values = np.asarray(df['time'], dtype=np.float64)
+    y_values = np.asarray(df['values'].get(column, np.array([], dtype=np.float64)), dtype=np.float64)
+    if visible_mask is None:
+        visible_mask = visible_mask_for_range(time_values, x_min, x_max)
+    visible_mask = np.asarray(visible_mask, dtype=bool)
+
+    y_visible = y_values[visible_mask]
+    clean = y_visible[np.isfinite(y_visible)]
+    total_points = int(clean.size)
+    if total_points == 0:
+        return ['No data in selected range for histogram.'], 0, 0, 'hist', None
+
+    bins = _histogram_bin_count(clean, width=width)
+    counts, edges = np.histogram(clean, bins=bins)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    # Render histogram bars (coarse enough for terminal readability).
+    plotext.bar(centers, counts, label=f'Histogram of {column}')
+
+    normal = _normality_stats(clean)
+    if normal and normal['std'] > 0 and bins > 1:
+        xs = np.linspace(float(np.min(clean)), float(np.max(clean)), num=min(180, max(40, width)))
+        sigma = normal['std']
+        mu = normal['mean']
+        pdf = (1.0 / (sigma * math.sqrt(2.0 * math.pi))) * np.exp(-0.5 * ((xs - mu) / sigma) ** 2)
+        bin_width = float(edges[1] - edges[0]) if edges.size > 1 else 1.0
+        scaled_pdf = pdf * total_points * bin_width
+        plotext.plot(xs, scaled_pdf, label='Gaussian fit')
+
+    y_label = _column_with_unit(column, units)
+    plotext.title(f'{y_label} Distribution')
+    plotext.xlabel(y_label)
+    plotext.ylabel('Count')
+    # Keep x labels compact to avoid unreadable long floats.
+    try:
+        xt = np.linspace(float(np.min(clean)), float(np.max(clean)), num=5)
+        xl = [f'{v:.4g}' for v in xt]
+        plotext.xticks(list(xt), xl)
+    except Exception:
+        pass
+
+    return plotext.build().split('\n'), total_points, bins, 'hist', normal
+
+
 def _prepare_trend_df(df, column, auto_stride_enabled, target_width, visible_mask=None, trend_series=None):
     time_values = np.asarray(df['time'], dtype=np.float64)
     y_values = np.asarray(df['values'].get(column, np.array([], dtype=np.float64)), dtype=np.float64)
@@ -601,7 +657,10 @@ def _prepare_trend_df(df, column, auto_stride_enabled, target_width, visible_mas
 
     if trend_series is None:
         trend_series = _compute_trend_for_column(df, column)
-    trend_vis = np.asarray(trend_series, dtype=np.float64)[visible_mask]
+    trend_arr = np.asarray(trend_series, dtype=np.float64)
+    if trend_arr.shape[0] != time_values.shape[0]:
+        trend_arr = _compute_trend_for_column(df, column)
+    trend_vis = trend_arr[visible_mask]
     trend_vis = trend_vis[finite]
     trend_finite = np.isfinite(trend_vis)
     trend_x = x_vis[trend_finite]
@@ -648,7 +707,69 @@ def _series_stats(series):
 def _format_stats(stats):
     if not stats:
         return 'no data'
-    return f"n={stats['n']} mu={stats['mean']:.4g} sigma={stats['std']:.4g}"
+    base = f"n={stats['n']} mu={stats['mean']:.4g} sigma={stats['std']:.4g}"
+    jb_p = stats.get('jb_p')
+    if jb_p is not None:
+        base = f'{base} jb_p={jb_p:.3g}'
+    return base
+
+
+def _normality_stats(values):
+    arr = np.asarray(values, dtype=np.float64)
+    clean = arr[np.isfinite(arr)]
+    if clean.size < 3:
+        return None
+    n = float(clean.size)
+    mu = float(np.mean(clean))
+    sigma = float(np.std(clean))
+    if sigma <= 0:
+        return {
+            'n': int(clean.size),
+            'mean': mu,
+            'std': sigma,
+            'skew': 0.0,
+            'kurtosis': 0.0,
+            'jb': 0.0,
+            'jb_p': 1.0,
+            'gaussian_like': True,
+        }
+    z = (clean - mu) / sigma
+    skew = float(np.mean(z ** 3))
+    kurtosis = float(np.mean(z ** 4) - 3.0)
+    jb = float((n / 6.0) * (skew ** 2 + 0.25 * (kurtosis ** 2)))
+    jb_p = float(math.exp(-0.5 * jb))
+    return {
+        'n': int(clean.size),
+        'mean': mu,
+        'std': sigma,
+        'skew': skew,
+        'kurtosis': kurtosis,
+        'jb': jb,
+        'jb_p': jb_p,
+        'gaussian_like': jb_p >= 0.05,
+    }
+
+
+def _histogram_bin_count(values, width=None):
+    arr = np.asarray(values, dtype=np.float64)
+    clean = arr[np.isfinite(arr)]
+    n = clean.size
+    if n <= 2:
+        return 1
+    target_bins = 24 if width is None else max(10, min(32, int(width // 5)))
+    vmin = float(np.min(clean))
+    vmax = float(np.max(clean))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        return 1
+    q75, q25 = np.percentile(clean, [75, 25])
+    iqr = float(q75 - q25)
+    if iqr <= 0:
+        return max(10, min(target_bins, int(round(math.sqrt(n)))))
+    bin_width = 2.0 * iqr * (n ** (-1.0 / 3.0))
+    if bin_width <= 0:
+        return max(10, min(target_bins, int(round(math.sqrt(n)))))
+    bins = int(math.ceil((vmax - vmin) / bin_width))
+    return max(10, min(target_bins, bins))
 
 
 def _log_ui_timing(event, started_at, **fields):
@@ -816,7 +937,17 @@ def edterm_main(stdscr, args, preloaded_df=None):
     units = getattr(args, '_preloaded_units', {}) if data_ready else {}
     columns = list(df.get('columns', [])) if data_ready else []
 
-    if not data_ready:
+    streaming_mode = bool(getattr(args, 'stream_load', False) and not data_ready)
+    stream_queue = None
+    stream_thread = None
+    stream_stop_event = None
+    stream_complete = False
+    stream_error = None
+    stream_records = 0
+    stream_total_bytes = 0
+    stream_reader = 'python-local'
+
+    if not data_ready and not streaming_mode:
         progress_buffer = ProgressBuffer()
         loading_started_at = time.time()
         last_draw_time = [0.0]
@@ -885,6 +1016,41 @@ def edterm_main(stdscr, args, preloaded_df=None):
             resize_happened = True
             range_changed = True
             status_message = ''
+    elif streaming_mode:
+        # Initialize empty dataset and start background streaming parser.
+        df = {'time': np.array([], dtype=np.float64), 'columns': [], 'values': {}}
+        units = {}
+        columns = []
+        stream_queue = queue.Queue()
+        stream_stop_event = threading.Event()
+
+        def _on_metadata(cols, unit_dict, total_bytes):
+            stream_queue.put(('meta', cols, unit_dict, int(total_bytes)))
+
+        def _on_batch(batch_time, batch_values, kept_count, bytes_read, total_bytes):
+            stream_queue.put(('batch', batch_time, batch_values, int(kept_count), int(bytes_read), int(total_bytes)))
+
+        def _on_progress(bytes_read, total_bytes, records_read):
+            stream_queue.put(('progress', int(bytes_read), int(total_bytes), int(records_read)))
+
+        def _on_complete(error_text):
+            stream_queue.put(('done', error_text))
+
+        def _run_stream():
+            stream_data(
+                args.file,
+                frame_stride=args.stride,
+                batch_size=200,
+                progress_stride=500,
+                on_metadata=_on_metadata,
+                on_batch=_on_batch,
+                on_progress=_on_progress,
+                on_complete=_on_complete,
+                stop_event=stream_stop_event,
+            )
+
+        stream_thread = threading.Thread(target=_run_stream, name='edr-stream-loader', daemon=True)
+        stream_thread.start()
 
     current_index = 0
     last_index = -1
@@ -903,6 +1069,7 @@ def edterm_main(stdscr, args, preloaded_df=None):
     time_unit_mode = 'auto'
     header_expanded = False
     current_stats = None
+    view_mode = 'time'
     trend_cache = {}
     trend_cache_lock = threading.Lock()
     trend_worker = None
@@ -913,6 +1080,71 @@ def edterm_main(stdscr, args, preloaded_df=None):
 
     try:
         while True:
+            if streaming_mode and stream_queue is not None:
+                processed_messages = 0
+                max_messages_per_tick = 32
+                while processed_messages < max_messages_per_tick:
+                    try:
+                        message = stream_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    processed_messages += 1
+
+                    tag = message[0]
+                    if tag == 'meta':
+                        _, cols, unit_dict, total_bytes = message
+                        columns = list(cols)
+                        units = dict(unit_dict) if isinstance(unit_dict, dict) else {}
+                        df['columns'] = columns
+                        if not df['values']:
+                            df['values'] = {col: np.array([], dtype=np.float64) for col in columns}
+                        stream_total_bytes = int(total_bytes)
+                        data_ready = True
+                        range_changed = True
+                    elif tag == 'batch':
+                        _, batch_time, batch_values, kept_count, bytes_read, total_bytes = message
+                        if batch_time is not None and len(batch_time) > 0:
+                            batch_time = np.asarray(batch_time, dtype=np.float64)
+                            df['time'] = np.concatenate([np.asarray(df['time'], dtype=np.float64), batch_time])
+                            for col in columns:
+                                existing = np.asarray(df['values'].get(col, np.array([], dtype=np.float64)), dtype=np.float64)
+                                incoming = np.asarray(batch_values.get(col, np.array([], dtype=np.float64)), dtype=np.float64)
+                                df['values'][col] = np.concatenate([existing, incoming])
+                            with trend_cache_lock:
+                                trend_cache.clear()
+                            stream_records = int(kept_count)
+                            stream_total_bytes = int(total_bytes)
+                            range_changed = True
+                        if stream_total_bytes > 0:
+                            plot_info_message = (
+                                f'Streaming {stream_records} frames '
+                                f'({bytes_read}/{stream_total_bytes} bytes) reader={stream_reader}'
+                            )
+                    elif tag == 'progress':
+                        _, bytes_read, total_bytes, records_read = message
+                        stream_records = int(records_read)
+                        stream_total_bytes = int(total_bytes)
+                        if stream_total_bytes > 0:
+                            plot_info_message = (
+                                f'Streaming {stream_records} frames '
+                                f'({bytes_read}/{stream_total_bytes} bytes) reader={stream_reader}'
+                            )
+                        # Keep UI responsive during long parse gaps between batches.
+                        range_changed = True
+                    elif tag == 'done':
+                        _, error_text = message
+                        stream_complete = True
+                        stream_error = error_text
+                        if error_text and error_text != 'stopped':
+                            status_message = f'Streaming failed: {error_text}'
+                        else:
+                            status_message = f'Stream complete: {len(df["time"])} frames loaded.'
+                        range_changed = True
+
+                if stream_complete and trend_worker is None and columns:
+                    trend_worker = TrendPrecomputeWorker(df, columns, trend_cache, trend_cache_lock)
+                    trend_worker.start()
+
             if input_mode == 'range':
                 stdscr.nodelay(0)
                 _safe_addstr(stdscr, max_y - 1, 0, 'Provide the desired time window (x_min x_max): ')
@@ -990,10 +1222,10 @@ def edterm_main(stdscr, args, preloaded_df=None):
                     stdscr,
                     2,
                     0,
-                    "q quit | arrows select | r range | s stride | u unit | i header | L/R overview pages"[: max(0, max_x - 1)],
+                    "q quit | arrows select | r range | s stride | u unit | h view | i header | L/R overview pages"[: max(0, max_x - 1)],
                 )
                 detail_line = (
-                    f"unit={time_unit_mode} stride={current_stride} auto={auto_mode} "
+                    f"unit={time_unit_mode} stride={current_stride} auto={auto_mode} view={view_mode} "
                     f"stats={_format_stats(current_stats)}"
                 )
                 _safe_addstr(stdscr, 3, 0, detail_line[: max(0, max_x - 1)])
@@ -1007,7 +1239,7 @@ def edterm_main(stdscr, args, preloaded_df=None):
             else:
                 _safe_addstr(stdscr, 0, 0, ' ' * max(0, max_x - 1))
                 compact_line = (
-                    f"{short_name} | unit={time_unit_mode} stride={current_stride} auto={auto_mode} "
+                    f"{short_name} | unit={time_unit_mode} stride={current_stride} auto={auto_mode} view={view_mode} "
                     f"| {_format_stats(current_stats)} | press i to expand"
                 )
                 _safe_addstr(stdscr, 0, 0, compact_line[: max(0, max_x - 1)])
@@ -1016,7 +1248,7 @@ def edterm_main(stdscr, args, preloaded_df=None):
                         stdscr.addch(1, x, curses.ACS_HLINE)
                     except curses.error:
                         break
-                header_plot_info_row = 0
+                header_plot_info_row = None
                 content_top = 2
 
             for x in range(max_x):
@@ -1131,20 +1363,34 @@ def edterm_main(stdscr, args, preloaded_df=None):
                                 trend_worker.prioritize(near)
 
                             plot_build_t0 = time.perf_counter()
-                            plot_lines, effective_stride, plotted_points, total_visible_points, sampling_mode, stats = plot_ascii(
-                                df,
-                                selected_column,
-                                units,
-                                plot_width,
-                                plot_height,
-                                x_min,
-                                x_max,
-                                current_stride,
-                                not args.no_auto_stride,
-                                time_unit_mode,
-                                visible_mask=visible_mask,
-                                trend_series=trend_series,
-                            )
+                            if view_mode == 'hist':
+                                plot_lines, plotted_points, bins, sampling_mode, stats = plot_histogram(
+                                    df,
+                                    selected_column,
+                                    units,
+                                    plot_width,
+                                    plot_height,
+                                    x_min,
+                                    x_max,
+                                    visible_mask=visible_mask,
+                                )
+                                effective_stride = current_stride
+                                total_visible_points = visible_rows
+                            else:
+                                plot_lines, effective_stride, plotted_points, total_visible_points, sampling_mode, stats = plot_ascii(
+                                    df,
+                                    selected_column,
+                                    units,
+                                    plot_width,
+                                    plot_height,
+                                    x_min,
+                                    x_max,
+                                    current_stride,
+                                    not args.no_auto_stride,
+                                    time_unit_mode,
+                                    visible_mask=visible_mask,
+                                    trend_series=trend_series,
+                                )
                             _log_ui_timing(
                                 'ui.plot_ascii',
                                 plot_build_t0,
@@ -1166,10 +1412,19 @@ def edterm_main(stdscr, args, preloaded_df=None):
                                 lines=(plot_row - content_top),
                             )
                             current_stats = stats
-                            plot_info_message = (
-                                f'Rendering {plotted_points}/{total_visible_points} points '
-                                f'(mode={sampling_mode}, stride={effective_stride}, set={current_stride}, auto={auto_mode}, unit={time_unit_mode})'
-                            )
+                            if view_mode == 'hist':
+                                normal_label = ''
+                                if stats and 'jb_p' in stats:
+                                    normal_label = f", jb_p={stats['jb_p']:.3g}, gaussian≈{'yes' if stats.get('gaussian_like') else 'no'}"
+                                plot_info_message = (
+                                    f'Histogram {plotted_points} samples '
+                                    f'(bins={bins}, unit={time_unit_mode}{normal_label})'
+                                )
+                            else:
+                                plot_info_message = (
+                                    f'Rendering {plotted_points}/{total_visible_points} points '
+                                    f'(mode={sampling_mode}, stride={effective_stride}, set={current_stride}, auto={auto_mode}, unit={time_unit_mode})'
+                                )
                         status_message = ''
                     except Exception:
                         logger.exception('Failed to render plot for selection %s', current_index)
@@ -1185,9 +1440,14 @@ def edterm_main(stdscr, args, preloaded_df=None):
                 stdscr.clrtoeol()
                 _safe_addstr(stdscr, footer_row, 0, status_message[: max(0, max_x - 1)])
 
-            _safe_addstr(stdscr, header_plot_info_row, 0, ' ' * max(0, max_x - 1))
-            if plot_info_message:
-                _safe_addstr(stdscr, header_plot_info_row, 0, plot_info_message[: max(0, max_x - 1)])
+            if header_plot_info_row is not None:
+                _safe_addstr(stdscr, header_plot_info_row, 0, ' ' * max(0, max_x - 1))
+                if plot_info_message:
+                    _safe_addstr(stdscr, header_plot_info_row, 0, plot_info_message[: max(0, max_x - 1)])
+            elif plot_info_message and not status_message:
+                stdscr.move(footer_row, 0)
+                stdscr.clrtoeol()
+                _safe_addstr(stdscr, footer_row, 0, plot_info_message[: max(0, max_x - 1)])
 
             stdscr.noutrefresh()
             curses.doupdate()
@@ -1223,6 +1483,10 @@ def edterm_main(stdscr, args, preloaded_df=None):
                     time_unit_mode = TIME_UNIT_CYCLE[(current_idx + 1) % len(TIME_UNIT_CYCLE)]
                     range_changed = True
                     status_message = f'Time unit mode: {time_unit_mode}'
+                elif char == 'h':
+                    view_mode = 'hist' if view_mode == 'time' else 'time'
+                    range_changed = True
+                    status_message = f'View mode: {view_mode}'
                 elif char == 'i':
                     header_expanded = not header_expanded
                     range_changed = True
@@ -1240,6 +1504,10 @@ def edterm_main(stdscr, args, preloaded_df=None):
                 overview_page += 1
                 range_changed = True
     finally:
+        if stream_stop_event is not None:
+            stream_stop_event.set()
+        if stream_thread is not None and stream_thread.is_alive():
+            stream_thread.join(timeout=0.5)
         if trend_worker is not None:
             trend_worker.stop()
 
@@ -1281,6 +1549,11 @@ def main():
         help='Show parser-provided loading progress (can be slower on very large files).',
     )
     parser.add_argument(
+        '--stream-load',
+        action='store_true',
+        help='Experimental: progressively stream frames and render partial plots while loading.',
+    )
+    parser.add_argument(
         '--no-cache',
         action='store_true',
         help='Disable disk cache reads/writes for this run.',
@@ -1296,7 +1569,7 @@ def main():
         return 1
 
     try:
-        if args.load_progress:
+        if args.load_progress or args.stream_load:
             curses.wrapper(edterm_main, args, None)
         else:
             load_t0 = time.perf_counter()
