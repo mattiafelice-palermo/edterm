@@ -52,33 +52,26 @@ The plot and interaction settings are configured to work out of the box, but the
 
 This tool is open for further development and contributions. Developers interested in contributing can clone the repository and submit pull requests.
 
-### Optional Rust Accelerator
+### Rust Accelerator
 
-An experimental Rust extension is available under `rust_ext/` to accelerate EDR parsing.
-It is optional: if unavailable or incompatible, `edterm` falls back to the Python parser.
+`edterm` ships with a bundled optional Rust extension (`edterm_rust_ext`) in the same package.
+When available, it is used automatically; otherwise, `edterm` falls back to the Python reader.
 
-Build/install in your active environment:
-
-```bash
-cd rust_ext
-pip install maturin
-maturin develop --release
-```
-
-Then run `edterm` normally. To force Python fallback, set:
+To force Python fallback, set:
 
 ```bash
 export EDTERM_DISABLE_RUST_READER=1
 ```
 
-After changing files under `rust_ext/`, rebuild:
+For development after editing files under `rust_ext/`, rebuild/install the package from repo root:
 
 ```bash
-cd rust_ext
-maturin develop --release
+python -m pip install -U pip build
+python -m build
+python -m pip install --force-reinstall dist/*.whl
 ```
 
-Timing logs in `.edterm_debug.log` include `mode=packed` when the fast packed Rust transfer path is active.
+Timing logs in `.edterm_debug.log` include `mode=packed` when the fast Rust transfer path is active.
 
 ## License
 

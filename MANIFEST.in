@@ -1,0 +1,5 @@
+include README.md
+include LICENSE
+include rust_ext/Cargo.toml
+include rust_ext/Cargo.lock
+recursive-include rust_ext/src *.rs
