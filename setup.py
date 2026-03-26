@@ -17,7 +17,7 @@ except Exception:
 
 setup(
     name='edterm',
-    version='0.1.5',
+    version='0.1.6',
     packages=find_packages(),
     description='A terminal-based GROMACS EDR data plotting tool',
     long_description=open('README.md', encoding='utf-8').read(),
