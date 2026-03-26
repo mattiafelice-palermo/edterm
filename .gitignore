@@ -7,6 +7,7 @@ __pycache__/
 .vscode*
 # C extensions
 *.so
+rust_ext/target/
 
 # Distribution / packaging
 .Python
@@ -160,6 +161,7 @@ cython_debug/
 
 # Temp files
 *~
+.edterm_debug.log
 
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

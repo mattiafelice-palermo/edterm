@@ -11,9 +11,8 @@ setup(
     author_email='mattiafelice.palermo@gmail.com',
     url='https://github.com/mattiafelice-palermo/edterm',
     install_requires=[
-        'pandas',
+        'numpy',
         'plotext',
-        'panedr',
     ],
     entry_points={
         'console_scripts': [
