@@ -46,7 +46,8 @@ __all__ = ['ENX_VERSION', 'edr_to_df', 'get_unit_dictionary']
 
 def edr_to_df(path: str,
               verbose: bool = False,
-              progress_callback=None) -> pd.DataFrame:
+              progress_callback=None,
+              frame_stride: int = 1) -> pd.DataFrame:
     """Calls :func:`read_edr` from ``pyedr`` and packs its return values into
     a ``pandas.DataFrame``.
 
@@ -66,6 +67,7 @@ def edr_to_df(path: str,
         path,
         verbose=verbose,
         progress_callback=progress_callback,
+        frame_stride=frame_stride,
     )
     df = pd.DataFrame(all_energies, columns=all_names, index=times)
     return df

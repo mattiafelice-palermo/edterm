@@ -43,6 +43,8 @@ The library exposes the following functions:
 """
 from mda_xdrlib import xdrlib
 import collections
+import mmap
+import struct
 import warnings
 from pathlib import Path
 from tqdm import tqdm
@@ -82,10 +84,29 @@ __all__ = ['ENX_VERSION', 'edr_to_dict', 'read_edr', 'get_unit_dictionary']
 
 
 class EDRFile(object):
-    def __init__(self, path):
-        content = Path(path).read_bytes()
-        self.data = GMX_Unpacker(content)
+    def __init__(self, path, use_fast_unpacker=True):
+        self._fh = open(path, 'rb')
+        self._mmap = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
+        if use_fast_unpacker:
+            try:
+                self.data = FastGMXUnpacker(self._mmap)
+            except Exception:
+                self.data = GMX_Unpacker(self._mmap)
+        else:
+            self.data = GMX_Unpacker(self._mmap)
         self.do_enxnms()
+
+    def __del__(self):
+        try:
+            if getattr(self, '_mmap', None) is not None:
+                self._mmap.close()
+        except Exception:
+            pass
+        try:
+            if getattr(self, '_fh', None) is not None:
+                self._fh.close()
+        except Exception:
+            pass
 
     def __iter__(self):
         while True:
@@ -252,7 +273,7 @@ class EDRFile(object):
             self.frame.nsteps = fr.step - self.step_prev
             self.frame.dt = 0
 
-    def do_enx(self):
+    def do_enx(self, parse_payload=True):
         data = self.data
         fr = self.frame
         file_version = self.file_version
@@ -273,6 +294,20 @@ class EDRFile(object):
             bSane |= (block.nsub > 0)
         if not (fr.step >= 0 and bSane):
             raise ValueError('Something went wrong')
+
+        # Fast skip path: for non-selected frames, skip payload with exact XDR layout.
+        # Old-format files require full parsing to keep sum-conversion state sane.
+        if (not parse_payload) and (file_version != 1):
+            for _ in range(fr.nre):
+                _skip_n_reals(data, 1)  # e
+                if fr.nsum > 0:
+                    _skip_n_reals(data, 2)  # eav, esum
+
+            for block in fr.block:
+                for sub in block.sub:
+                    _skip_subblock(data, sub)
+            return
+
         if fr.nre > fr.e_alloc:
             for i in range(fr.nre - fr.e_alloc):
                 fr.ener.append(Energy())
@@ -433,6 +468,113 @@ class GMX_Unpacker(xdrlib.Unpacker):
         return self.unpack_float()
 
 
+class FastGMXUnpacker:
+    """Minimal XDR unpacker optimized for sequential reads from mmap."""
+
+    _i32 = struct.Struct('>i')
+    _u32 = struct.Struct('>I')
+    _i64 = struct.Struct('>q')
+    _f32 = struct.Struct('>f')
+    _f64 = struct.Struct('>d')
+
+    def __init__(self, data):
+        self._buf = memoryview(data)
+        self._len = len(self._buf)
+        self._pos = 0
+        self.gmx_double = False
+
+    def get_buffer(self):
+        return self._buf
+
+    def get_position(self):
+        return self._pos
+
+    def set_position(self, position):
+        if position < 0 or position > self._len:
+            raise EOFError
+        self._pos = position
+
+    def _ensure(self, nbytes):
+        if self._pos + nbytes > self._len:
+            raise EOFError
+
+    def unpack_int(self):
+        self._ensure(4)
+        value = self._i32.unpack_from(self._buf, self._pos)[0]
+        self._pos += 4
+        return value
+
+    def unpack_uint(self):
+        self._ensure(4)
+        value = self._u32.unpack_from(self._buf, self._pos)[0]
+        self._pos += 4
+        return value
+
+    def unpack_hyper(self):
+        self._ensure(8)
+        value = self._i64.unpack_from(self._buf, self._pos)[0]
+        self._pos += 8
+        return value
+
+    def unpack_float(self):
+        self._ensure(4)
+        value = self._f32.unpack_from(self._buf, self._pos)[0]
+        self._pos += 4
+        return value
+
+    def unpack_double(self):
+        self._ensure(8)
+        value = self._f64.unpack_from(self._buf, self._pos)[0]
+        self._pos += 8
+        return value
+
+    def unpack_string(self):
+        length = self.unpack_uint()
+        padded = ((length + 3) // 4) * 4
+        self._ensure(padded)
+        start = self._pos
+        end = start + length
+        self._pos += padded
+        return bytes(self._buf[start:end])
+
+    def unpack_real(self):
+        if self.gmx_double:
+            return self.unpack_double()
+        return self.unpack_float()
+
+
+def _skip_n_reals(data, n):
+    if n <= 0:
+        return
+    size = 8 if data.gmx_double else 4
+    data.set_position(data.get_position() + (n * size))
+
+
+def _skip_subblock(data, sub):
+    fixed_sizes = {
+        xdr_datatype_int: 4,
+        xdr_datatype_float: 4,
+        xdr_datatype_double: 8,
+        xdr_datatype_int64: 8,
+        xdr_datatype_char: 4,  # chars are encoded as int32 in EDR
+    }
+    block_size = fixed_sizes.get(sub.type)
+    if block_size is not None:
+        data.set_position(data.get_position() + (sub.nr * block_size))
+        return
+
+    if sub.type == xdr_datatype_string:
+        # Fast-skip XDR strings without materializing Python bytes objects.
+        for _ in range(sub.nr):
+            length = data.unpack_uint()
+            padded = ((length + 3) // 4) * 4
+            data.set_position(data.get_position() + padded)
+        return
+
+    raise ValueError("Reading unknown block data type: "
+                     "this file is corrupted or from the future")
+
+
 def ndo_int(data, n):
     """mimic of gmx_fio_ndo_int in gromacs"""
     return [data.unpack_int() for i in range(n)]
@@ -496,7 +638,8 @@ read_edr_return_type = Tuple[all_energies_type,
 def read_edr(path: str,
              verbose: bool = False,
              progress_callback: Optional[Callable[[int, int, int], None]] = None,
-             progress_stride: int = 1000) -> read_edr_return_type:
+             progress_stride: int = 1000,
+             frame_stride: int = 1) -> read_edr_return_type:
     """Parse EDR files and make contents available in Python
 
     :func:`read_edr` does the actual reading of EDR files. It is called by
@@ -521,28 +664,59 @@ def read_edr(path: str,
     times: list[float]
         A list containing the time of each step/frame.
     """
-    edr_file = EDRFile(path)
-    total_bytes = len(edr_file.data.get_buffer())
-    all_energies = []
-    all_names = [u'Time'] + [nm.name for nm in edr_file.nms]
-    times = []
-    iterator = tqdm(enumerate(edr_file), disable=(not verbose))
-    for ifr, frame in iterator:
-        if frame.ener:
-            # Export only frames that contain energies
-            times.append(frame.t)
-            all_energies.append([frame.t] + [ener.e for ener in frame.ener])
-        if progress_callback is not None and (ifr == 0 or (ifr + 1) % max(1, progress_stride) == 0):
+    frame_stride = max(1, int(frame_stride))
+
+    def _read_with_unpacker(use_fast_unpacker):
+        edr_file = EDRFile(path, use_fast_unpacker=use_fast_unpacker)
+        total_bytes = len(edr_file.data.get_buffer())
+        all_energies = []
+        all_names = [u'Time'] + [nm.name for nm in edr_file.nms]
+        times = []
+
+        frame_count = 0
+        # Reuse frame allocations across iterations to reduce Python object churn.
+        edr_file.frame = Frame()
+        iterator = tqdm(disable=(not verbose))
+        while True:
             try:
-                progress_callback(edr_file.data.get_position(), total_bytes, ifr + 1)
+                keep_frame = (frame_count % frame_stride) == 0
+                edr_file.do_enx(parse_payload=keep_frame)
+                frame = edr_file.frame
+            except EOFError:
+                break
+
+            if verbose:
+                iterator.update(1)
+
+            if keep_frame and frame.ener:
+                # Export only frames that contain energies.
+                times.append(frame.t)
+                all_energies.append([frame.t] + [frame.ener[i].e for i in range(frame.nre)])
+
+            if progress_callback is not None and (frame_count == 0 or (frame_count + 1) % max(1, progress_stride) == 0):
+                try:
+                    progress_callback(edr_file.data.get_position(), total_bytes, frame_count + 1)
+                except Exception:
+                    pass
+
+            frame_count += 1
+
+        if verbose:
+            iterator.close()
+
+        if progress_callback is not None:
+            try:
+                progress_callback(total_bytes, total_bytes, frame_count)
             except Exception:
                 pass
-    if progress_callback is not None:
-        try:
-            progress_callback(total_bytes, total_bytes, len(times))
-        except Exception:
-            pass
-    return all_energies, all_names, times
+
+        return all_energies, all_names, times
+
+    try:
+        return _read_with_unpacker(use_fast_unpacker=True)
+    except Exception:
+        # Fallback path preserves compatibility on unexpected corner cases.
+        return _read_with_unpacker(use_fast_unpacker=False)
 
 
 def get_unit_dictionary(path: str) -> Dict[str, str]:
@@ -569,7 +743,8 @@ def get_unit_dictionary(path: str) -> Dict[str, str]:
 
 def edr_to_dict(path: str,
                 verbose: bool = False,
-                progress_callback: Optional[Callable[[int, int, int], None]] = None) -> Dict[str, np.ndarray]:
+                progress_callback: Optional[Callable[[int, int, int], None]] = None,
+                frame_stride: int = 1) -> Dict[str, np.ndarray]:
     """Calls :func:`read_edr` and packs its return values into a dictionary
 
     The returned dictionary's keys are the names of the energy terms present in
@@ -591,6 +766,7 @@ def edr_to_dict(path: str,
         path,
         verbose=verbose,
         progress_callback=progress_callback,
+        frame_stride=frame_stride,
     )
     energy_dict = {}
     for idx, name in enumerate(all_names):
