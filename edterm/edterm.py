@@ -2,7 +2,6 @@ import argparse
 import curses
 import locale
 import logging
-import math
 import os
 import queue
 import re
@@ -12,9 +11,24 @@ import time
 from collections import deque
 
 import numpy as np
-import plotext
 
+from .analysis import (
+    TIME_UNIT_CYCLE,
+    _compute_trend_for_column,
+    _format_stats,
+    range_has_data,
+    visible_mask_for_range,
+)
 from .data_reader import load_data, load_units, stream_data
+from .plotting import plot_ascii, plot_histogram
+from .ui.render import (
+    _clear_region,
+    _safe_addstr,
+    draw_overview,
+    parse_and_print_ansi,
+    render_loading_box,
+    setup_colors,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -22,16 +36,7 @@ logger_handler = logging.FileHandler('.edterm_debug.log')
 logger_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 logger.addHandler(logger_handler)
 
-ANSI_ESCAPE = re.compile(r'\x1b\[([0-9;]*)m')
 PERCENT_RE = re.compile(r'(\d{1,3}(?:\.\d+)?)\s*%')
-AUTO_STRIDE_OVERSAMPLE_FACTOR = 3
-TIME_UNIT_FACTORS_PS = {
-    'fs': 0.001,
-    'ps': 1.0,
-    'ns': 1000.0,
-    'us': 1_000_000.0,
-}
-TIME_UNIT_CYCLE = ['auto', 'fs', 'ps', 'ns', 'us']
 
 
 def setup_environment():
@@ -103,154 +108,6 @@ def validate_loaded_dataframe(df):
             return f"Column '{column}' has inconsistent length."
 
     return None
-
-
-def setup_colors(theme):
-    curses.start_color()
-    curses.use_default_colors()
-
-    background_color = -1
-    if theme == 'dark':
-        background_color = 16
-    elif theme == 'light':
-        background_color = 15
-
-    max_colors = max(0, getattr(curses, 'COLORS', 0) - 1)
-    max_pairs = max(0, getattr(curses, 'COLOR_PAIRS', 0) - 1)
-    init_limit = min(max_colors, max_pairs)
-
-    for i in range(1, init_limit + 1):
-        try:
-            curses.init_pair(i, i, background_color)
-        except curses.error:
-            break
-
-
-def _safe_color_pair(color_id):
-    try:
-        return curses.color_pair(color_id)
-    except curses.error:
-        return curses.color_pair(0)
-
-
-def _theme_color_ids(theme):
-    if theme == 'dark':
-        return {
-            'default': 15,
-            'line_primary': 15,
-            'line_secondary': 156,
-            'axis': 156,
-        }
-    if theme == 'light':
-        return {
-            'default': 232,
-            'line_primary': 4,
-            'line_secondary': 156,
-            'axis': 8,
-        }
-    return {
-        'default': 0,
-        'line_primary': 11,
-        'line_secondary': 15,
-        'axis': 15,
-    }
-
-
-def _safe_addstr(stdscr, y, x, text, color_pair=None):
-    try:
-        if color_pair is None:
-            stdscr.addstr(y, x, text)
-        else:
-            stdscr.addstr(y, x, text, color_pair)
-    except curses.error:
-        return
-
-
-def _clear_region(stdscr, top, left, height, width):
-    if height <= 0 or width <= 0:
-        return
-    blank = ' ' * width
-    for y in range(top, top + height):
-        _safe_addstr(stdscr, y, left, blank)
-
-
-def _color_for_ansi_code(code, theme_color_ids, default_pair):
-    if not code:
-        return default_pair
-
-    if code.startswith('38;5;0'):
-        return _safe_color_pair(theme_color_ids['default'])
-    if code == '38;5;12':
-        return _safe_color_pair(theme_color_ids['line_primary'])
-    if code.startswith('48;5;'):
-        return _safe_color_pair(theme_color_ids['line_secondary'])
-    if code == '38;5;10':
-        return _safe_color_pair(theme_color_ids['axis'])
-
-    return default_pair
-
-
-def parse_and_print_ansi(stdscr, y, x, ansi_string, theme, extra_attr=0):
-    theme_color_ids = _theme_color_ids(theme)
-    default_pair = _safe_color_pair(theme_color_ids['default'])
-
-    pieces = ANSI_ESCAPE.split(ansi_string)
-    if not pieces:
-        return
-
-    x_offset = 0
-    current_pair = default_pair
-
-    first_text = pieces[0]
-    if first_text:
-        _safe_addstr(stdscr, y, x + x_offset, first_text, current_pair | extra_attr)
-        x_offset += len(first_text)
-
-    index = 1
-    while index < len(pieces):
-        code = pieces[index] if index < len(pieces) else ''
-        text = pieces[index + 1] if index + 1 < len(pieces) else ''
-        current_pair = _color_for_ansi_code(code, theme_color_ids, default_pair)
-
-        if text:
-            _safe_addstr(stdscr, y, x + x_offset, text, current_pair | extra_attr)
-            x_offset += len(text)
-
-        index += 2
-
-
-def _adaptive_centered_window(num_points):
-    if num_points <= 2:
-        return 1
-    window = max(5, min(301, num_points // 25))
-    if window % 2 == 0:
-        window += 1
-    return min(window, num_points if num_points % 2 == 1 else max(1, num_points - 1))
-
-
-def calculate_centered_moving_average(values):
-    y = np.asarray(values, dtype=np.float64)
-    if y.size == 0:
-        return y
-    window = _adaptive_centered_window(y.size)
-    if window <= 1:
-        return y.copy()
-    kernel = np.ones(window, dtype=np.float64)
-    valid = np.isfinite(y)
-    filled = np.where(valid, y, 0.0)
-    summed = np.convolve(filled, kernel, mode='same')
-    counts = np.convolve(valid.astype(np.float64), kernel, mode='same')
-    trend = np.empty_like(y)
-    trend.fill(np.nan)
-    np.divide(summed, counts, out=trend, where=counts > 0)
-    return trend
-
-
-def _compute_trend_for_column(df, column):
-    values = np.asarray(df['values'].get(column, np.array([], dtype=np.float64)), dtype=np.float64)
-    if values.size == 0:
-        return values
-    return calculate_centered_moving_average(values)
 
 
 def _get_or_compute_trend(df, column, trend_cache, trend_cache_lock):
@@ -329,71 +186,6 @@ class TrendPrecomputeWorker:
                 logger.exception("Background trend precompute failed for column '%s'", col)
 
 
-def range_has_data(df, x_min, x_max):
-    time_values = np.asarray(df['time'], dtype=np.float64)
-    if time_values.size == 0:
-        return False
-    mask = (time_values >= x_min) & (time_values <= x_max)
-    return bool(np.any(mask))
-
-
-def visible_mask_for_range(time_values, x_min, x_max):
-    if x_min is not None and x_max is not None:
-        return (time_values >= x_min) & (time_values <= x_max)
-    return np.ones(time_values.shape[0], dtype=bool)
-
-
-def calculate_effective_stride(total_points, plot_width, user_stride, oversample_factor=AUTO_STRIDE_OVERSAMPLE_FACTOR):
-    base_stride = max(1, user_stride)
-    if total_points <= 0 or plot_width <= 0:
-        return base_stride
-
-    target_points = max(1, plot_width * oversample_factor)
-    auto_stride = max(1, math.ceil(total_points / target_points))
-    return max(base_stride, auto_stride)
-
-
-def _dedup_preserve_order(values):
-    seen = set()
-    ordered = []
-    for value in values:
-        if value not in seen:
-            seen.add(value)
-            ordered.append(value)
-    return ordered
-
-
-def downsample_minmax_by_chunks(x_values, y_values, target_points):
-    x = np.asarray(x_values, dtype=np.float64)
-    y = np.asarray(y_values, dtype=np.float64)
-    total_points = x.shape[0]
-    if total_points <= target_points or target_points <= 2:
-        return x, y
-
-    bins = max(1, target_points // 2)
-    chunk_size = max(1, math.ceil(total_points / bins))
-    x_parts = []
-    y_parts = []
-
-    for start in range(0, total_points, chunk_size):
-        end = min(total_points, start + chunk_size)
-        cx = x[start:end]
-        cy = y[start:end]
-        if cx.size == 0:
-            continue
-
-        min_pos = int(np.argmin(cy))
-        max_pos = int(np.argmax(cy))
-        extrema = [min_pos, max_pos] if min_pos <= max_pos else [max_pos, min_pos]
-        selected_local = _dedup_preserve_order([0] + extrema + [cx.size - 1])
-        x_parts.append(cx[selected_local])
-        y_parts.append(cy[selected_local])
-
-    if not x_parts:
-        return x, y
-    return np.concatenate(x_parts), np.concatenate(y_parts)
-
-
 class ProgressBuffer:
     def __init__(self):
         self._latest_line = ''
@@ -462,316 +254,6 @@ class ProgressBuffer:
                 )
 
 
-def _render_loading_box(stdscr, menu_width, max_x, max_y, elapsed_seconds, progress_pct=None, progress_line=''):
-    plot_left = menu_width + 4
-    box_width = max(10, max_x - plot_left - 2)
-    bar_width = max(10, min(60, box_width - 2))
-
-    if progress_pct is None:
-        spinner = ['|', '/', '-', '\\']
-        spin_char = spinner[int(elapsed_seconds * 8) % len(spinner)]
-        phase = elapsed_seconds % 2.0
-        progress = phase if phase <= 1.0 else (2.0 - phase)
-        filled = int(progress * bar_width)
-        bar = '[' + ('#' * filled) + ('-' * (bar_width - filled)) + f'] {spin_char}'
-        mode_line = 'Progress: records processed (total unknown)'
-    else:
-        filled = int((progress_pct / 100.0) * bar_width)
-        bar = '[' + ('#' * filled) + ('-' * (bar_width - filled)) + f'] {progress_pct:5.1f}%'
-        mode_line = 'Progress: percentage reported by loader'
-
-    message = 'Loading EDR file...'
-    hint = "Press 'q' to quit."
-    elapsed_text = f'Elapsed: {elapsed_seconds:0.1f}s'
-
-    center_y = max(6, max_y // 2)
-    for y in range(max(4, center_y - 1), min(max_y - 1, center_y + 5)):
-        _safe_addstr(stdscr, y, plot_left, ' ' * max(0, box_width - 1))
-    _safe_addstr(stdscr, center_y - 1, plot_left, message[: max(0, box_width - 1)])
-    _safe_addstr(stdscr, center_y, plot_left, bar[: max(0, box_width - 1)])
-    _safe_addstr(stdscr, center_y + 1, plot_left, elapsed_text[: max(0, box_width - 1)])
-    _safe_addstr(stdscr, center_y + 2, plot_left, mode_line[: max(0, box_width - 1)])
-    if progress_line:
-        _safe_addstr(stdscr, center_y + 3, plot_left, progress_line[: max(0, box_width - 1)])
-        _safe_addstr(stdscr, center_y + 4, plot_left, hint[: max(0, box_width - 1)])
-    else:
-        _safe_addstr(stdscr, center_y + 3, plot_left, hint[: max(0, box_width - 1)])
-
-
-def plot_ascii(
-    df,
-    column,
-    units,
-    width,
-    height,
-    x_min=None,
-    x_max=None,
-    stride=1,
-    auto_stride_enabled=True,
-    time_unit_mode='auto',
-    visible_mask=None,
-    trend_series=None,
-):
-    if width <= 0 or height <= 0:
-        return ['Terminal too small to render plot.'], 1, 0, 0, 'raw', None
-
-    plotext.clf()
-    plotext.plotsize(width, height)
-
-    time_values = np.asarray(df['time'], dtype=np.float64)
-    y_values = np.asarray(df['values'].get(column, np.array([], dtype=np.float64)), dtype=np.float64)
-    if visible_mask is None:
-        visible_mask = visible_mask_for_range(time_values, x_min, x_max)
-    visible_mask = np.asarray(visible_mask, dtype=bool)
-
-    x_visible = time_values[visible_mask]
-    y_visible = y_values[visible_mask]
-    finite_visible = np.isfinite(x_visible) & np.isfinite(y_visible)
-    x_visible = x_visible[finite_visible]
-    y_visible = y_visible[finite_visible]
-    total_visible_points = x_visible.shape[0]
-    sampling_mode = 'raw'
-
-    if auto_stride_enabled:
-        target_points = max(1, width * AUTO_STRIDE_OVERSAMPLE_FACTOR)
-        sampled_x, sampled_y = downsample_minmax_by_chunks(x_visible, y_visible, target_points)
-        if stride > 1 and sampled_x.size > 0:
-            sampled_x = sampled_x[::stride]
-            sampled_y = sampled_y[::stride]
-        filtered_x, filtered_y = sampled_x, sampled_y
-        effective_stride = calculate_effective_stride(total_visible_points, width, stride)
-        sampling_mode = 'minmax'
-    else:
-        effective_stride = max(1, stride)
-        filtered_x = x_visible[::effective_stride] if total_visible_points > 0 else x_visible
-        filtered_y = y_visible[::effective_stride] if total_visible_points > 0 else y_visible
-
-    trend_x = np.array([], dtype=np.float64)
-    trend_y = np.array([], dtype=np.float64)
-    if x_visible.size > 0:
-        if trend_series is None:
-            trend_series = _compute_trend_for_column(df, column)
-        trend_arr = np.asarray(trend_series, dtype=np.float64)
-        if trend_arr.shape[0] != time_values.shape[0]:
-            trend_arr = _compute_trend_for_column(df, column)
-        trend_visible = trend_arr[visible_mask]
-        trend_visible = trend_visible[finite_visible]
-        trend_finite = np.isfinite(trend_visible)
-        trend_x = x_visible[trend_finite]
-        trend_y = trend_visible[trend_finite]
-        if auto_stride_enabled and trend_x.size > 0:
-            trend_x, trend_y = downsample_minmax_by_chunks(trend_x, trend_y, max(1, width * AUTO_STRIDE_OVERSAMPLE_FACTOR))
-
-    if filtered_x.size > 0:
-        time_scale, time_unit = _time_axis_config(filtered_x, time_unit_mode)
-        x_plot = filtered_x / time_scale
-    else:
-        time_scale, time_unit = _time_axis_config(x_visible if x_visible.size > 0 else time_values, time_unit_mode)
-        x_plot = (x_visible / time_scale) if x_visible.size > 0 else (time_values / time_scale)
-
-    if filtered_x.size > 0:
-        plotext.plot(x_plot, filtered_y, label=column)
-    elif x_visible.size > 0:
-        plotext.plot(x_plot, y_visible, label=column)
-
-    if trend_x.size > 0:
-        trend_x_values = trend_x / time_scale
-        plotext.plot(trend_x_values, trend_y, label=f'Centered MA of {column}')
-
-    y_label = _column_with_unit(column, units)
-    plotext.title(f'{y_label} over Time')
-    plotext.xlabel(f'Time ({time_unit})')
-    plotext.ylabel(y_label)
-
-    stats = _series_stats(y_visible)
-    return plotext.build().split('\n'), effective_stride, filtered_x.size, total_visible_points, sampling_mode, stats
-
-
-def plot_histogram(df, column, units, width, height, x_min=None, x_max=None, visible_mask=None):
-    if width <= 0 or height <= 0:
-        return ['Terminal too small to render plot.'], 0, 0, 'hist', None
-
-    plotext.clf()
-    plotext.plotsize(width, height)
-
-    time_values = np.asarray(df['time'], dtype=np.float64)
-    y_values = np.asarray(df['values'].get(column, np.array([], dtype=np.float64)), dtype=np.float64)
-    if visible_mask is None:
-        visible_mask = visible_mask_for_range(time_values, x_min, x_max)
-    visible_mask = np.asarray(visible_mask, dtype=bool)
-
-    y_visible = y_values[visible_mask]
-    clean = y_visible[np.isfinite(y_visible)]
-    total_points = int(clean.size)
-    if total_points == 0:
-        return ['No data in selected range for histogram.'], 0, 0, 'hist', None
-
-    bins = _histogram_bin_count(clean, width=width)
-    counts, edges = np.histogram(clean, bins=bins)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-
-    # Render histogram bars (coarse enough for terminal readability).
-    plotext.bar(centers, counts, label=f'Histogram of {column}')
-
-    normal = _normality_stats(clean)
-    if normal and normal['std'] > 0 and bins > 1:
-        xs = np.linspace(float(np.min(clean)), float(np.max(clean)), num=min(180, max(40, width)))
-        sigma = normal['std']
-        mu = normal['mean']
-        pdf = (1.0 / (sigma * math.sqrt(2.0 * math.pi))) * np.exp(-0.5 * ((xs - mu) / sigma) ** 2)
-        bin_width = float(edges[1] - edges[0]) if edges.size > 1 else 1.0
-        scaled_pdf = pdf * total_points * bin_width
-        plotext.plot(xs, scaled_pdf, label='Gaussian fit')
-
-    y_label = _column_with_unit(column, units)
-    plotext.title(f'{y_label} Distribution')
-    plotext.xlabel(y_label)
-    plotext.ylabel('Count')
-    # Keep x labels compact to avoid unreadable long floats.
-    try:
-        xt = np.linspace(float(np.min(clean)), float(np.max(clean)), num=5)
-        xl = [f'{v:.4g}' for v in xt]
-        plotext.xticks(list(xt), xl)
-    except Exception:
-        pass
-
-    return plotext.build().split('\n'), total_points, bins, 'hist', normal
-
-
-def _prepare_trend_df(df, column, auto_stride_enabled, target_width, visible_mask=None, trend_series=None):
-    time_values = np.asarray(df['time'], dtype=np.float64)
-    y_values = np.asarray(df['values'].get(column, np.array([], dtype=np.float64)), dtype=np.float64)
-    if y_values.size == 0:
-        return np.array([]), np.array([]), 0, 0
-
-    if visible_mask is None:
-        visible_mask = np.ones(time_values.shape[0], dtype=bool)
-
-    x_vis = time_values[visible_mask]
-    y_vis = y_values[visible_mask]
-    finite = np.isfinite(x_vis) & np.isfinite(y_vis)
-    x_vis = x_vis[finite]
-    total_visible_points = x_vis.shape[0]
-    if total_visible_points == 0:
-        return np.array([]), np.array([]), 0, 0
-
-    if trend_series is None:
-        trend_series = _compute_trend_for_column(df, column)
-    trend_arr = np.asarray(trend_series, dtype=np.float64)
-    if trend_arr.shape[0] != time_values.shape[0]:
-        trend_arr = _compute_trend_for_column(df, column)
-    trend_vis = trend_arr[visible_mask]
-    trend_vis = trend_vis[finite]
-    trend_finite = np.isfinite(trend_vis)
-    trend_x = x_vis[trend_finite]
-    trend_y = trend_vis[trend_finite]
-    if auto_stride_enabled and trend_x.size > 0:
-        trend_x, trend_y = downsample_minmax_by_chunks(trend_x, trend_y, max(1, target_width * 2))
-    return trend_x, trend_y, x_vis.shape[0], total_visible_points
-
-
-def _time_axis_config(time_series, unit_mode='auto'):
-    if time_series is None or len(time_series) == 0:
-        return 1.0, 'ps'
-    if unit_mode in TIME_UNIT_FACTORS_PS:
-        return TIME_UNIT_FACTORS_PS[unit_mode], unit_mode
-    max_time = float(time_series.max())
-    if max_time < 1000.0:
-        return 1.0, 'ps'
-    return 1000.0, 'ns'
-
-
-def _column_with_unit(column, units):
-    if not units:
-        return column
-    unit = units.get(column)
-    if unit:
-        return f'{column} ({unit})'
-    return column
-
-
-def _series_stats(series):
-    if series is None:
-        return None
-    arr = np.asarray(series, dtype=np.float64)
-    clean = arr[np.isfinite(arr)]
-    if clean.size == 0:
-        return None
-    return {
-        'n': int(clean.size),
-        'mean': float(np.mean(clean)),
-        'std': float(np.std(clean)),
-    }
-
-
-def _format_stats(stats):
-    if not stats:
-        return 'no data'
-    base = f"n={stats['n']} mu={stats['mean']:.4g} sigma={stats['std']:.4g}"
-    jb_p = stats.get('jb_p')
-    if jb_p is not None:
-        base = f'{base} jb_p={jb_p:.3g}'
-    return base
-
-
-def _normality_stats(values):
-    arr = np.asarray(values, dtype=np.float64)
-    clean = arr[np.isfinite(arr)]
-    if clean.size < 3:
-        return None
-    n = float(clean.size)
-    mu = float(np.mean(clean))
-    sigma = float(np.std(clean))
-    if sigma <= 0:
-        return {
-            'n': int(clean.size),
-            'mean': mu,
-            'std': sigma,
-            'skew': 0.0,
-            'kurtosis': 0.0,
-            'jb': 0.0,
-            'jb_p': 1.0,
-            'gaussian_like': True,
-        }
-    z = (clean - mu) / sigma
-    skew = float(np.mean(z ** 3))
-    kurtosis = float(np.mean(z ** 4) - 3.0)
-    jb = float((n / 6.0) * (skew ** 2 + 0.25 * (kurtosis ** 2)))
-    jb_p = float(math.exp(-0.5 * jb))
-    return {
-        'n': int(clean.size),
-        'mean': mu,
-        'std': sigma,
-        'skew': skew,
-        'kurtosis': kurtosis,
-        'jb': jb,
-        'jb_p': jb_p,
-        'gaussian_like': jb_p >= 0.05,
-    }
-
-
-def _histogram_bin_count(values, width=None):
-    arr = np.asarray(values, dtype=np.float64)
-    clean = arr[np.isfinite(arr)]
-    n = clean.size
-    if n <= 2:
-        return 1
-    target_bins = 24 if width is None else max(10, min(32, int(width // 5)))
-    vmin = float(np.min(clean))
-    vmax = float(np.max(clean))
-    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
-        return 1
-    q75, q25 = np.percentile(clean, [75, 25])
-    iqr = float(q75 - q25)
-    if iqr <= 0:
-        return max(10, min(target_bins, int(round(math.sqrt(n)))))
-    bin_width = 2.0 * iqr * (n ** (-1.0 / 3.0))
-    if bin_width <= 0:
-        return max(10, min(target_bins, int(round(math.sqrt(n)))))
-    bins = int(math.ceil((vmax - vmin) / bin_width))
-    return max(10, min(target_bins, bins))
-
-
 def _log_ui_timing(event, started_at, **fields):
     try:
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
@@ -784,148 +266,13 @@ def _log_ui_timing(event, started_at, **fields):
         return
 
 
-def _build_overview_panel_lines(trend_x, trend_y, display_label, base_column, width, height, units, time_unit_mode, stats):
-    if width <= 0 or height <= 0:
-        return ['']
-    if trend_x.size == 0 or trend_y.size == 0:
-        return ['No data']
-
-    plotext.clf()
-    plotext.plotsize(width, height)
-    time_scale, time_unit = _time_axis_config(trend_x, time_unit_mode)
-    x_values = trend_x / time_scale
-    plotext.plot(x_values, trend_y)
-    panel_label = _column_with_unit(base_column, units)
-    if display_label:
-        panel_label = f'{display_label} {panel_label}'
-    plotext.title(panel_label[: max(1, width - 2)])
-    plotext.xlabel(f'Time ({time_unit})')
-    plotext.ylabel('')
-    if stats:
-        note = f"mu={stats['mean']:.3g} sigma={stats['std']:.3g}"
-        plotext.hline(stats['mean'], color='white')
-        plotext.xlabel((f'Time ({time_unit}) | {note}')[: max(1, width - 2)])
-    return plotext.build().split('\n')
-
-
-def draw_overview(
-    stdscr,
-    df,
-    columns,
-    units,
-    menu_width,
-    max_x,
-    max_y,
-    content_top,
-    content_bottom,
-    x_min,
-    x_max,
-    stride,
-    auto_stride_enabled,
-    page,
-    theme,
-    time_unit_mode,
-    visible_mask=None,
-    trend_cache=None,
-    trend_cache_lock=None,
-):
-    plot_left = menu_width + 4
-    plot_width = max_x - menu_width - 5
-    plot_height = max(0, content_bottom - content_top)
-
-    if plot_width <= 30 or plot_height <= 12:
-        return 'Terminal is too small for overview.', 0, 0
-
-    n_cols = 2
-    n_rows = 3
-    per_page = 6
-    total_pages = max(1, math.ceil(len(columns) / per_page))
-    page = max(0, min(page, total_pages - 1))
-    start_idx = page * per_page
-    shown_columns = columns[start_idx:start_idx + per_page]
-
-    cell_w = max(14, plot_width // n_cols)
-    cell_h = max(8, plot_height // n_rows)
-
-    _clear_region(stdscr, content_top, plot_left, plot_height, plot_width)
-
-    plotted_count = 0
-    no_data_count = 0
-    if visible_mask is None:
-        visible_mask = visible_mask_for_range(np.asarray(df['time'], dtype=np.float64), x_min, x_max)
-
-    for local_idx, column in enumerate(shown_columns):
-        absolute_idx = start_idx + local_idx
-        grid_row = local_idx // n_cols
-        grid_col = local_idx % n_cols
-
-        x0 = plot_left + (grid_col * cell_w)
-        y0 = content_top + (grid_row * cell_h)
-        panel_w = max(10, cell_w - 1)
-        panel_h = max(6, cell_h - 1)
-
-        trend_series = None
-        if trend_cache is not None:
-            if trend_cache_lock is None:
-                trend_series = trend_cache.get(column)
-            else:
-                with trend_cache_lock:
-                    trend_series = trend_cache.get(column)
-            if trend_series is None:
-                if trend_cache_lock is None:
-                    trend_series = _compute_trend_for_column(df, column)
-                    trend_cache[column] = trend_series
-                else:
-                    trend_series = _get_or_compute_trend(df, column, trend_cache, trend_cache_lock)
-
-        trend_x, trend_y, _, _ = _prepare_trend_df(
-            df,
-            column,
-            auto_stride_enabled,
-            panel_w,
-            visible_mask=visible_mask,
-            trend_series=trend_series,
-        )
-        col_values = np.asarray(df['values'].get(column, np.array([], dtype=np.float64)), dtype=np.float64)
-        stats_source = col_values[visible_mask] if col_values.size > 0 else np.array([], dtype=np.float64)
-        stats = _series_stats(stats_source)
-        panel_lines = _build_overview_panel_lines(
-            trend_x,
-            trend_y,
-            f'{absolute_idx + 1}.',
-            column,
-            panel_w,
-            panel_h,
-            units,
-            time_unit_mode,
-            stats,
-        )
-
-        if trend_x.size == 0:
-            no_data_count += 1
-        else:
-            plotted_count += 1
-
-        row_ptr = y0
-        for line in panel_lines:
-            if row_ptr >= content_bottom:
-                break
-            # Do not slice raw ANSI strings; slicing can break escape sequences.
-            line_attr = curses.A_BOLD if row_ptr == y0 else 0
-            parse_and_print_ansi(stdscr, row_ptr, x0, line, theme, extra_attr=line_attr)
-            row_ptr += 1
-
-    info = (
-        f'Overview page {page + 1}/{total_pages} '
-        f'({len(shown_columns)} shown, trend={plotted_count}, no-data={no_data_count}) '
-        f'- LEFT/RIGHT pages'
-    )
-    return info, plotted_count, total_pages
-
-
 def edterm_main(stdscr, args, preloaded_df=None):
     curses.curs_set(0)
     setup_colors(args.theme)
+    try:
+        curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+    except curses.error:
+        pass
     stdscr.nodelay(1)
     stdscr.clear()
 
@@ -969,7 +316,7 @@ def edterm_main(stdscr, args, preloaded_df=None):
                     break
             elapsed = now - loading_started_at
             progress_pct, progress_line = progress_buffer.snapshot()
-            _render_loading_box(stdscr, menu_width, max_x, max_y, elapsed, progress_pct, progress_line)
+            render_loading_box(stdscr, menu_width, max_x, max_y, elapsed, progress_pct, progress_line)
             _safe_addstr(stdscr, 3, 0, ' ' * max(0, max_x - 1))
             loading_line = (
                 f'Reader: {loading_reader[0]} | '
@@ -1198,7 +545,6 @@ def edterm_main(stdscr, args, preloaded_df=None):
                 curses.noecho()
                 input_mode = None
                 stdscr.nodelay(1)
-
             new_max_y, new_max_x = stdscr.getmaxyx()
             if new_max_y != max_y or new_max_x != max_x:
                 max_y, max_x = new_max_y, new_max_x
@@ -1229,6 +575,7 @@ def edterm_main(stdscr, args, preloaded_df=None):
                     f"stats={_format_stats(current_stats)}"
                 )
                 _safe_addstr(stdscr, 3, 0, detail_line[: max(0, max_x - 1)])
+                _safe_addstr(stdscr, 0, max(0, max_x - 26), '[i/click: collapse]')
                 for x in range(max_x):
                     try:
                         stdscr.addch(4, x, curses.ACS_HLINE)
@@ -1240,7 +587,7 @@ def edterm_main(stdscr, args, preloaded_df=None):
                 _safe_addstr(stdscr, 0, 0, ' ' * max(0, max_x - 1))
                 compact_line = (
                     f"{short_name} | unit={time_unit_mode} stride={current_stride} auto={auto_mode} view={view_mode} "
-                    f"| {_format_stats(current_stats)} | press i to expand"
+                    f"| {_format_stats(current_stats)} | [i/click: expand]"
                 )
                 _safe_addstr(stdscr, 0, 0, compact_line[: max(0, max_x - 1)])
                 for x in range(max_x):
@@ -1339,6 +686,8 @@ def edterm_main(stdscr, args, preloaded_df=None):
                                 visible_mask=visible_mask,
                                 trend_cache=trend_cache,
                                 trend_cache_lock=trend_cache_lock,
+                                trend_getter=_get_or_compute_trend,
+                                trend_computer=_compute_trend_for_column,
                             )
                             _log_ui_timing(
                                 'ui.draw_overview',
@@ -1490,6 +839,46 @@ def edterm_main(stdscr, args, preloaded_df=None):
                 elif char == 'i':
                     header_expanded = not header_expanded
                     range_changed = True
+
+            if k == curses.KEY_MOUSE:
+                try:
+                    _, mx, my, _, bstate = curses.getmouse()
+                except Exception:
+                    bstate = 0
+                    mx, my = -1, -1
+
+                left_click = bool(
+                    bstate
+                    & (
+                        getattr(curses, 'BUTTON1_CLICKED', 0)
+                        | getattr(curses, 'BUTTON1_PRESSED', 0)
+                        | getattr(curses, 'BUTTON1_RELEASED', 0)
+                    )
+                )
+                if left_click:
+                    menu_row = content_top
+                    # Header click toggles expanded/collapsed top section.
+                    header_click_row = 0 if not header_expanded else 1
+                    if my == header_click_row and 0 <= mx < max_x:
+                        header_expanded = not header_expanded
+                        range_changed = True
+                        status_message = 'Header expanded.' if header_expanded else 'Header collapsed.'
+                    # Left menu click selects overview/observable.
+                    elif 0 <= mx < menu_width and menu_row <= my < (menu_row + 1 + len(columns)):
+                        selected = my - menu_row
+                        if 0 <= selected <= len(columns):
+                            current_index = selected
+                            range_changed = True
+                    # Overview page click zones on plot area edges.
+                    elif current_index == 0 and content_top <= my < footer_sep_row and mx > menu_width:
+                        left_zone = menu_width + 1
+                        right_zone = max_x - 8
+                        if mx <= left_zone + 2 and overview_page > 0:
+                            overview_page -= 1
+                            range_changed = True
+                        elif mx >= right_zone and overview_page < (overview_total_pages - 1):
+                            overview_page += 1
+                            range_changed = True
 
             if k == curses.KEY_UP and current_index > 0:
                 current_index -= 1
